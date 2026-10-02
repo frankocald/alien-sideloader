@@ -1,0 +1,2638 @@
+diff --git a/ios/appservice/appservice.go b/ios/appservice/appservice.go
+index 6147dbb..db6abf9 100644
+--- a/ios/appservice/appservice.go
++++ b/ios/appservice/appservice.go
+@@ -3,6 +3,7 @@ package appservice
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -24,6 +25,7 @@ type Connection struct {
+ 	conn     *xpc.Connection
+ 	deviceId string
+ 	device   ios.DeviceEntry
++	ctx      context.Context
+ }
+ 
+ const (
+@@ -36,12 +38,16 @@ const (
+ // New creates a new connection to the appservice on the device for iOS17+.
+ // It returns an error if the connection could not be established.
+ func New(deviceEntry ios.DeviceEntry) (*Connection, error) {
+-	xpcConn, err := ios.ConnectToXpcServiceTunnelIface(deviceEntry, "com.apple.coredevice.appservice")
++	return NewWithContext(context.Background(), deviceEntry)
++}
++
++func NewWithContext(ctx context.Context, deviceEntry ios.DeviceEntry) (*Connection, error) {
++	xpcConn, err := ios.ConnectToXpcServiceTunnelIfaceContext(ctx, deviceEntry, "com.apple.coredevice.appservice")
+ 	if err != nil {
+ 		return nil, fmt.Errorf("new: %w", err)
+ 	}
+ 
+-	return &Connection{conn: xpcConn, deviceId: uuid.New().String(), device: deviceEntry}, nil
++	return &Connection{conn: xpcConn, deviceId: uuid.New().String(), device: deviceEntry, ctx: ctx}, nil
+ }
+ 
+ // LaunchedAppWithStdIo is the launched app with a connection to the stdio-socket
+@@ -85,7 +91,7 @@ func (c *Connection) LaunchApp(bundleId string, args []interface{}, env map[stri
+ // LaunchAppWithStdIo launches an app and connects to the stdio-socket
+ // the returned value implements the io.ReadWriteCloser interface and needs to be closed when finished using the stdio-socket
+ func (c *Connection) LaunchAppWithStdIo(bundleId string, args []interface{}, env map[string]interface{}, options map[string]interface{}, terminateExisting bool) (LaunchedAppWithStdIo, error) {
+-	stdio, err := openstdio.NewOpenStdIoSocket(c.device)
++	stdio, err := openstdio.NewOpenStdIoSocketContext(c.ctx, c.device)
+ 	if err != nil {
+ 		return LaunchedAppWithStdIo{}, fmt.Errorf("LaunchAppWithStdIo: failed to open stdio socket: %w", err)
+ 	}
+@@ -99,6 +105,7 @@ func (c *Connection) LaunchAppWithStdIo(bundleId string, args []interface{}, env
+ 
+ 	pid, err := c.launchApp(bundleId, args, env, options, terminateExisting, stdIoConfig)
+ 	if err != nil {
++		stdio.Close()
+ 		return LaunchedAppWithStdIo{}, fmt.Errorf("LaunchAppWithStdIo: failed to launch app: %w", err)
+ 	}
+ 	return LaunchedAppWithStdIo{
+diff --git a/ios/appservice/context_test.go b/ios/appservice/context_test.go
+new file mode 100644
+index 0000000..1aa96d4
+--- /dev/null
++++ b/ios/appservice/context_test.go
+@@ -0,0 +1,54 @@
++package appservice
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/danielpaulus/go-ios/ios"
++)
++
++func TestCancellationInterruptsAppServiceHandshake(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	closed := make(chan struct{})
++	go func() {
++		conn, err := listener.Accept()
++		if err != nil {
++			close(closed)
++			return
++		}
++		defer conn.Close()
++		io.Copy(io.Discard, conn)
++		close(closed)
++	}()
++	device := ios.DeviceEntry{Address: "127.0.0.1", Rsd: ios.RsdHandshakeResponse{Services: map[string]ios.RsdServiceEntry{"com.apple.coredevice.appservice": {Port: uint32(listener.Addr().(*net.TCPAddr).Port)}}}}
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++	returned := make(chan error, 1)
++	go func() {
++		service, err := NewWithContext(ctx, device)
++		if service != nil {
++			service.Close()
++		}
++		returned <- err
++	}()
++	select {
++	case err := <-returned:
++		if err == nil {
++			t.Fatal("stalled handshake succeeded")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("cancelled constructor stayed blocked")
++	}
++	select {
++	case <-closed:
++	case <-time.After(time.Second):
++		t.Fatal("constructor leaked its socket")
++	}
++}
+diff --git a/ios/connect.go b/ios/connect.go
+index 27fb033..08ff298 100755
+--- a/ios/connect.go
++++ b/ios/connect.go
+@@ -1,6 +1,7 @@
+ package ios
+ 
+ import (
++	"context"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -125,6 +126,10 @@ func RsdPortForService(rsd RsdPortProvider, service string) (int, error) {
+ // to the provided service.
+ // The 'RSDCheckin' required by shim services is also executed before returning the connection to the caller
+ func ConnectToShimService(device DeviceEntry, service string) (DeviceConnectionInterface, error) {
++	return ConnectToShimServiceContext(context.Background(), device, service)
++}
++
++func ConnectToShimServiceContext(ctx context.Context, device DeviceEntry, service string) (DeviceConnectionInterface, error) {
+ 	if !device.SupportsRsd() {
+ 		return nil, fmt.Errorf("ConnectToShimService: Cannot connect to %s, missing tunnel address and RSD port.  To start the tunnel, run `ios tunnel start`", service)
+ 	}
+@@ -132,12 +137,13 @@ func ConnectToShimService(device DeviceEntry, service string) (DeviceConnectionI
+ 	if err != nil {
+ 		return nil, fmt.Errorf("ConnectToShimService: %w", err)
+ 	}
+-	conn, err := ConnectTUNDevice(device.Address, port, device)
++	conn, err := ConnectTUNDeviceContext(ctx, device.Address, port, device)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	err = RsdCheckin(conn)
+ 	if err != nil {
++		conn.Close()
+ 		return nil, err
+ 	}
+ 	return NewDeviceConnectionWithRWC(conn), nil
+@@ -146,6 +152,10 @@ func ConnectToShimService(device DeviceEntry, service string) (DeviceConnectionI
+ // ConnectToServiceTunnelIface connects to a service on an iOS17+ device using a XPC over HTTP2 connection
+ // It returns a new xpc.Connection
+ func ConnectToXpcServiceTunnelIface(device DeviceEntry, serviceName string) (*xpc.Connection, error) {
++	return ConnectToXpcServiceTunnelIfaceContext(context.Background(), device, serviceName)
++}
++
++func ConnectToXpcServiceTunnelIfaceContext(ctx context.Context, device DeviceEntry, serviceName string) (*xpc.Connection, error) {
+ 	if !device.SupportsRsd() {
+ 		return nil, fmt.Errorf("ConnectToXpcServiceTunnelIface: Cannot connect to %s, missing tunnel address and RSD port. To start the tunnel, run `ios tunnel start`", serviceName)
+ 	}
+@@ -154,19 +164,29 @@ func ConnectToXpcServiceTunnelIface(device DeviceEntry, serviceName string) (*xp
+ 		return nil, fmt.Errorf("ConnectToXpcServiceTunnelIface: %w", err)
+ 	}
+ 
+-	conn, err := ConnectTUNDevice(device.Address, port, device)
++	conn, err := ConnectTUNDeviceContext(ctx, device.Address, port, device)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("ConnectToHttp2: failed to dial: %w", err)
+ 	}
+ 
+ 	h, err := http.NewHttpConnection(conn)
+ 	if err != nil {
++		conn.Close()
+ 		return nil, fmt.Errorf("ConnectToXpcServiceTunnelIface: failed to connect to http2: %w", err)
+ 	}
+-	return CreateXpcConnection(h)
++	xpcConn, err := CreateXpcConnection(h)
++	if err != nil {
++		h.Close()
++		return nil, err
++	}
++	return xpcConn, nil
+ }
+ 
+ func ConnectToServiceTunnelIface(device DeviceEntry, serviceName string) (DeviceConnectionInterface, error) {
++	return ConnectToServiceTunnelIfaceContext(context.Background(), device, serviceName)
++}
++
++func ConnectToServiceTunnelIfaceContext(ctx context.Context, device DeviceEntry, serviceName string) (DeviceConnectionInterface, error) {
+ 	if !device.SupportsRsd() {
+ 		return nil, fmt.Errorf("ConnectToServiceTunnelIface: Cannot connect to %s, missing tunnel address and RSD port. To start the tunnel, run `ios tunnel start`", serviceName)
+ 	}
+@@ -175,7 +195,7 @@ func ConnectToServiceTunnelIface(device DeviceEntry, serviceName string) (Device
+ 		return nil, fmt.Errorf("ConnectToServiceTunnelIface: %w", err)
+ 	}
+ 
+-	conn, err := ConnectTUNDevice(device.Address, port, device)
++	conn, err := ConnectTUNDeviceContext(ctx, device.Address, port, device)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("ConnectToServiceTunnelIface: failed to connect to tunnel: %w", err)
+ 	}
+@@ -358,6 +378,16 @@ func ConnectTUNDevice(remoteIp string, port int, d DeviceEntry) (*net.TCPConn, e
+ 	if err != nil {
+ 		return nil, fmt.Errorf("ConnectUserSpaceTunnel: failed to set keepalive period: %w", err)
+ 	}
++	if len(d.UserspaceTUNToken) != 0 {
++		if len(d.UserspaceTUNToken) != 32 {
++			_ = conn.Close()
++			return nil, fmt.Errorf("invalid userspace tunnel credential")
++		}
++		if _, err := conn.Write(d.UserspaceTUNToken); err != nil {
++			_ = conn.Close()
++			return nil, err
++		}
++	}
+ 	_, err = conn.Write(net.ParseIP(remoteIp).To16())
+ 	portBytes := make([]byte, 4)
+ 	binary.LittleEndian.PutUint32(portBytes, uint32(port))
+diff --git a/ios/connect_context.go b/ios/connect_context.go
+new file mode 100644
+index 0000000..8b1f134
+--- /dev/null
++++ b/ios/connect_context.go
+@@ -0,0 +1,67 @@
++package ios
++
++import (
++	"context"
++	"encoding/binary"
++	"fmt"
++	"net"
++	"strconv"
++	"sync"
++)
++
++// ConnectTUNDeviceContext owns one service socket, never the parent tunnel.
++// Its context covers dialing, service handshakes and subsequent RPC reads.
++func ConnectTUNDeviceContext(ctx context.Context, remoteIP string, port int, device DeviceEntry) (net.Conn, error) {
++	if port <= 0 || port > 65535 {
++		return nil, fmt.Errorf("invalid RSD service port %d", port)
++	}
++	address := net.JoinHostPort(remoteIP, strconv.Itoa(port))
++	if device.UserspaceTUN {
++		address = net.JoinHostPort(device.UserspaceTUNHost, strconv.Itoa(device.UserspaceTUNPort))
++	}
++	dialer := net.Dialer{Timeout: TunnelDialTimeout}
++	raw, err := dialer.DialContext(ctx, "tcp", address)
++	if err != nil {
++		return nil, err
++	}
++	conn := &contextServiceConn{Conn: raw}
++	conn.stop = context.AfterFunc(ctx, func() { conn.once.Do(func() { raw.Close() }) })
++	if device.UserspaceTUN {
++		ip := net.ParseIP(remoteIP).To16()
++		if ip == nil {
++			conn.Close()
++			return nil, fmt.Errorf("invalid tunnel IPv6 address")
++		}
++		if len(device.UserspaceTUNToken) != 0 {
++			if len(device.UserspaceTUNToken) != 32 {
++				conn.Close()
++				return nil, fmt.Errorf("invalid userspace tunnel credential")
++			}
++			if _, err := conn.Write(device.UserspaceTUNToken); err != nil {
++				conn.Close()
++				return nil, err
++			}
++		}
++		request := make([]byte, 20)
++		copy(request, ip)
++		binary.LittleEndian.PutUint32(request[16:], uint32(port))
++		if _, err := conn.Write(request); err != nil {
++			conn.Close()
++			return nil, err
++		}
++	}
++	return conn, nil
++}
++
++type contextServiceConn struct {
++	net.Conn
++	stop func() bool
++	once sync.Once
++}
++
++func (c *contextServiceConn) Close() error {
++	c.stop()
++	var err error
++	c.once.Do(func() { err = c.Conn.Close() })
++	return err
++}
+diff --git a/ios/dtx_codec/channel_context_test.go b/ios/dtx_codec/channel_context_test.go
+new file mode 100644
+index 0000000..4e7d9f2
+--- /dev/null
++++ b/ios/dtx_codec/channel_context_test.go
+@@ -0,0 +1,24 @@
++package dtx
++
++import (
++	"context"
++	"errors"
++	"testing"
++)
++
++func TestDriverChannelWaitHonorsCancellation(t *testing.T) {
++	connection := &Connection{requestChannelMessages: make(chan Message), closed: make(chan struct{})}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := connection.ForChannelRequestContext(ctx, nil); !errors.Is(err, context.Canceled) {
++		t.Fatalf("cancellation lost: %v", err)
++	}
++}
++
++func TestDriverChannelWaitHonorsConnectionClose(t *testing.T) {
++	connection := &Connection{requestChannelMessages: make(chan Message), closed: make(chan struct{})}
++	connection.close(ErrConnectionClosed)
++	if _, err := connection.ForChannelRequestContext(context.Background(), nil); !errors.Is(err, ErrConnectionClosed) {
++		t.Fatalf("connection close lost: %v", err)
++	}
++}
+diff --git a/ios/dtx_codec/connection.go b/ios/dtx_codec/connection.go
+index 5057d4e..f03c5d1 100644
+--- a/ios/dtx_codec/connection.go
++++ b/ios/dtx_codec/connection.go
+@@ -183,7 +183,11 @@ func NewUsbmuxdConnection(device ios.DeviceEntry, serviceName string) (*Connecti
+ 
+ // NewTunnelConnection connects and starts reading from a Dtx based service on the device, using tunnel interface instead of usbmuxd
+ func NewTunnelConnection(device ios.DeviceEntry, serviceName string) (*Connection, error) {
+-	conn, err := ios.ConnectToServiceTunnelIface(device, serviceName)
++	return NewTunnelConnectionContext(context.Background(), device, serviceName)
++}
++
++func NewTunnelConnectionContext(ctx context.Context, device ios.DeviceEntry, serviceName string) (*Connection, error) {
++	conn, err := ios.ConnectToServiceTunnelIfaceContext(ctx, device, serviceName)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -254,7 +258,19 @@ func SendAckIfNeeded(dtxConn *Connection, msg Message) {
+ }
+ 
+ func (dtxConn *Connection) ForChannelRequest(messageDispatcher Dispatcher) *Channel {
+-	msg := <-dtxConn.requestChannelMessages
++	channel, _ := dtxConn.ForChannelRequestContext(context.Background(), messageDispatcher)
++	return channel
++}
++
++func (dtxConn *Connection) ForChannelRequestContext(ctx context.Context, messageDispatcher Dispatcher) (*Channel, error) {
++	var msg Message
++	select {
++	case msg = <-dtxConn.requestChannelMessages:
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-dtxConn.Closed():
++		return nil, dtxConn.Err()
++	}
+ 	dtxConn.mutex.Lock()
+ 	defer dtxConn.mutex.Unlock()
+ 	// code := msg.Auxiliary.GetArguments()[0].(uint32)
+@@ -263,7 +279,7 @@ func (dtxConn *Connection) ForChannelRequest(messageDispatcher Dispatcher) *Chan
+ 	// TODO: try to refactor testmanagerd/xcuitest code and use AddDefaultChannelReceiver instead of this function. The only code calling this is in testmanagerd right now.
+ 	channel := &Channel{channelCode: -1, channelName: identifier[0].(string), messageIdentifier: 1, connection: dtxConn, messageDispatcher: messageDispatcher, responseWaiters: map[int]chan Message{}, defragmenters: map[int]*FragmentDecoder{}, timeout: 5 * time.Second}
+ 	dtxConn.activeChannels.Store(-1, channel)
+-	return channel
++	return channel, nil
+ }
+ 
+ // AddDefaultChannelReceiver let's you set the Dispatcher for the Channel with code -1 ( or 4294967295 for uint32).
+diff --git a/ios/installationproxy/installationproxy.go b/ios/installationproxy/installationproxy.go
+index 8a70730..b683398 100644
+--- a/ios/installationproxy/installationproxy.go
++++ b/ios/installationproxy/installationproxy.go
+@@ -2,6 +2,7 @@ package installationproxy
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 
+ 	ios "github.com/danielpaulus/go-ios/ios"
+@@ -9,9 +10,10 @@ import (
+ 	"howett.net/plist"
+ )
+ 
+-const logModule = "go-ios/installationproxy"
++const logModule = "Link Core/InstallationProxy"
+ 
+ const serviceName = "com.apple.mobile.installation_proxy"
++const shimServiceName = "com.apple.mobile.installation_proxy.shim.remote"
+ 
+ // maxBrowseChunks bounds how many BrowseResponse chunks browseApps will accept
+ // from a device before giving up. A healthy device paginates its app list in a
+@@ -62,7 +64,17 @@ func (c *Connection) Close() {
+ }
+ 
+ func New(device ios.DeviceEntry) (*Connection, error) {
+-	deviceConn, err := ios.ConnectToService(device, serviceName)
++	return NewWithContext(context.Background(), device)
++}
++
++func NewWithContext(ctx context.Context, device ios.DeviceEntry) (*Connection, error) {
++	var deviceConn ios.DeviceConnectionInterface
++	var err error
++	if device.SupportsRsd() {
++		deviceConn, err = ios.ConnectToShimServiceContext(ctx, device, shimServiceName)
++	} else {
++		deviceConn, err = ios.ConnectToService(device, serviceName)
++	}
+ 	if err != nil {
+ 		return &Connection{}, err
+ 	}
+diff --git a/ios/listdevices.go b/ios/listdevices.go
+index e08a273..49a09e0 100755
+--- a/ios/listdevices.go
++++ b/ios/listdevices.go
+@@ -53,14 +53,15 @@ type DeviceList struct {
+ // f.ex. to enable LockdownSSL. More importantly it contains
+ // DeviceProperties where the udid is stored.
+ type DeviceEntry struct {
+-	DeviceID         int
+-	MessageType      string
+-	Properties       DeviceProperties
+-	Address          string
+-	Rsd              RsdPortProvider
+-	UserspaceTUN     bool
+-	UserspaceTUNHost string
+-	UserspaceTUNPort int
++	DeviceID          int
++	MessageType       string
++	Properties        DeviceProperties
++	Address           string
++	Rsd               RsdPortProvider
++	UserspaceTUN      bool
++	UserspaceTUNHost  string
++	UserspaceTUNToken []byte `json:"-"`
++	UserspaceTUNPort  int
+ }
+ 
+ // DeviceProperties contains important device related info like the udid which is named SerialNumber
+diff --git a/ios/lockdown_value.go b/ios/lockdown_value.go
+index 6edb586..d2b0c2b 100755
+--- a/ios/lockdown_value.go
++++ b/ios/lockdown_value.go
+@@ -154,6 +154,17 @@ func (lockDownConn *LockDownConnection) GetValues() (GetAllValuesResponse, error
+ 
+ // GetProductVersion gets the iOS version of a device
+ func GetProductVersion(device DeviceEntry) (*semver.Version, error) {
++	if device.SupportsRsd() {
++		versionSource, ok := device.Rsd.(interface{ GetOSVersion() string })
++		if !ok || versionSource.GetOSVersion() == "" {
++			return nil, fmt.Errorf("GetProductVersion: RSD peer did not advertise OSVersion")
++		}
++		version, err := semver.NewVersion(versionSource.GetOSVersion())
++		if err != nil {
++			return nil, fmt.Errorf("GetProductVersion: invalid RSD OSVersion: %w", err)
++		}
++		return version, nil
++	}
+ 	lockdownConnection, err := ConnectLockdownWithSession(device)
+ 	if err != nil {
+ 		return &semver.Version{}, err
+diff --git a/ios/nskeyedarchiver/attachment_optional_test.go b/ios/nskeyedarchiver/attachment_optional_test.go
+new file mode 100644
+index 0000000..cc7f3a4
+--- /dev/null
++++ b/ios/nskeyedarchiver/attachment_optional_test.go
+@@ -0,0 +1,110 @@
++package nskeyedarchiver
++
++import (
++	"bytes"
++	"strings"
++	"testing"
++
++	"howett.net/plist"
++)
++
++// This encodes the real failure-diagnostic shape: XCActivityRecord -> NSArray
++// -> XCTAttachment, whose optional userInfo points at the archive null object.
++func failureDiagnosticArchive(t *testing.T, metadata interface{}, includeMetadata bool, extra []interface{}) []byte {
++	t.Helper()
++	attachment := map[string]interface{}{
++		"$class": plist.UID(10), "lifetime": uint64(0),
++		"uniformTypeIdentifier": plist.UID(11), "fileNameOverride": plist.UID(0),
++		"timestamp": plist.UID(12), "name": plist.UID(13), "payload": plist.UID(14),
++	}
++	if includeMetadata {
++		attachment["userInfo"] = metadata
++	}
++	objects := []interface{}{
++		"$null",
++		map[string]interface{}{"$class": plist.UID(2), "finish": plist.UID(0), "start": plist.UID(0), "uuid": plist.UID(3), "title": plist.UID(5), "attachments": plist.UID(6), "activityType": plist.UID(9)},
++		map[string]interface{}{"$classname": "XCActivityRecord"},
++		map[string]interface{}{"$class": plist.UID(4), "NS.uuidbytes": make([]byte, 16)},
++		map[string]interface{}{"$classname": "NSUUID"},
++		"Failure diagnostics",
++		map[string]interface{}{"$class": plist.UID(7), "NS.objects": []interface{}{plist.UID(8)}},
++		map[string]interface{}{"$classname": "NSArray"},
++		attachment,
++		"com.apple.dt.xctest.activity-type.attachmentContainer",
++		map[string]interface{}{"$classname": "XCTAttachment"},
++		"public.plain-text",
++		float64(123),
++		"Failure diagnostic",
++		[]byte("original failure diagnostic payload"),
++	}
++	objects = append(objects, extra...)
++	data, err := plist.Marshal(map[string]interface{}{"$archiver": "NSKeyedArchiver", "$version": uint64(100000), "$objects": objects, "$top": map[string]interface{}{"root": plist.UID(1)}}, plist.BinaryFormat)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return data
++}
++
++func TestFailureDiagnosticAttachmentAllowsOptionalUserInfo(t *testing.T) {
++	for _, test := range []struct {
++		name     string
++		include  bool
++		metadata interface{}
++		extra    []interface{}
++	}{
++		{name: "absent"},
++		{name: "null UID", include: true, metadata: plist.UID(0)},
++		{name: "null sentinel", include: true, metadata: plist.UID(15), extra: []interface{}{"$null"}},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			decoded, err := Unarchive(failureDiagnosticArchive(t, test.metadata, test.include, test.extra))
++			if err != nil {
++				t.Fatal(err)
++			}
++			activity := decoded[0].(XCActivityRecord)
++			if len(activity.Attachments) != 1 {
++				t.Fatal("diagnostic attachment lost")
++			}
++			attachment := activity.Attachments[0]
++			if attachment.Name != "Failure diagnostic" || !bytes.Equal(attachment.Payload, []byte("original failure diagnostic payload")) || attachment.userInfo != nil {
++				t.Fatalf("attachment changed: %+v", attachment)
++			}
++		})
++	}
++}
++
++func TestAttachmentUserInfoDictionaryErrorsAreNotDiscarded(t *testing.T) {
++	for _, test := range []struct {
++		name     string
++		metadata interface{}
++		extra    []interface{}
++		want     string
++	}{
++		{name: "not a reference", metadata: "invalid", want: "must be an object UID"},
++		{name: "out of range", metadata: plist.UID(999), want: "out of range"},
++		{name: "not a dictionary", metadata: plist.UID(15), extra: []interface{}{"invalid"}, want: "must reference NSDictionary"},
++		{name: "malformed dictionary", metadata: plist.UID(15), extra: []interface{}{map[string]interface{}{"$class": plist.UID(16), "NS.keys": "invalid", "NS.objects": []interface{}{}}, map[string]interface{}{"$classname": "NSDictionary"}}, want: "NS.keys is not an array"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			_, err := Unarchive(failureDiagnosticArchive(t, test.metadata, true, test.extra))
++			if err == nil || !strings.Contains(err.Error(), "XCTAttachment.userInfo") || !strings.Contains(err.Error(), test.want) {
++				t.Fatalf("malformed metadata error lost: %v", err)
++			}
++		})
++	}
++}
++
++func TestAttachmentUserInfoPreservesDictionary(t *testing.T) {
++	for _, name := range []string{"NSDictionary", "NSMutableDictionary"} {
++		t.Run(name, func(t *testing.T) {
++			extra := []interface{}{map[string]interface{}{"$class": plist.UID(16), "NS.keys": []interface{}{plist.UID(17)}, "NS.objects": []interface{}{plist.UID(18)}}, map[string]interface{}{"$classname": name}, "key", "value"}
++			decoded, err := Unarchive(failureDiagnosticArchive(t, plist.UID(15), true, extra))
++			if err != nil {
++				t.Fatal(err)
++			}
++			if decoded[0].(XCActivityRecord).Attachments[0].userInfo["key"] != "value" {
++				t.Fatal("dictionary metadata lost")
++			}
++		})
++	}
++}
+diff --git a/ios/nskeyedarchiver/objectivec_classes.go b/ios/nskeyedarchiver/objectivec_classes.go
+index 9c0e560..5d7f409 100644
+--- a/ios/nskeyedarchiver/objectivec_classes.go
++++ b/ios/nskeyedarchiver/objectivec_classes.go
+@@ -333,7 +333,12 @@ func NewXCTAttachment(object map[string]interface{}, objects []interface{}) inte
+ 	fileNameOverride := objects[object["fileNameOverride"].(plist.UID)].(string)
+ 	timestamp := objects[object["timestamp"].(plist.UID)].(float64)
+ 	name := objects[object["name"].(plist.UID)].(string)
+-	userInfo, _ := extractDictionary(objects[object["userInfo"].(plist.UID)].(map[string]interface{}), objects, 0)
++	userInfo, err := extractAttachmentUserInfo(object, objects)
++	if err != nil {
++		// Decoder factories have no error return. Unarchive converts this into
++		// its normal decode error; malformed metadata must not be discarded.
++		panic(fmt.Errorf("XCTAttachment.userInfo: %w", err))
++	}
+ 
+ 	payloadRaw := objects[object["payload"].(plist.UID)]
+ 	payload := extractAttachmentPayload(payloadRaw, objects)
+@@ -349,6 +354,47 @@ func NewXCTAttachment(object map[string]interface{}, objects []interface{}) inte
+ 	}
+ }
+ 
++func extractAttachmentUserInfo(object map[string]interface{}, objects []interface{}) (map[string]interface{}, error) {
++	raw, present := object["userInfo"]
++	if !present || raw == nil {
++		return nil, nil
++	}
++	ref, ok := raw.(plist.UID)
++	if !ok {
++		return nil, fmt.Errorf("must be an object UID, got %T", raw)
++	}
++	if ref == 0 {
++		return nil, nil
++	}
++	if uint64(ref) >= uint64(len(objects)) {
++		return nil, fmt.Errorf("object UID %d out of range", ref)
++	}
++	value := objects[ref]
++	if value == nil {
++		return nil, nil
++	}
++	if sentinel, ok := value.(string); ok && sentinel == null {
++		return nil, nil
++	}
++	dictionary, ok := value.(map[string]interface{})
++	if !ok {
++		return nil, fmt.Errorf("must reference NSDictionary, got %T", value)
++	}
++	classRef, ok := dictionary[class].(plist.UID)
++	if !ok || uint64(classRef) >= uint64(len(objects)) {
++		return nil, fmt.Errorf("dictionary class UID is invalid")
++	}
++	classObject, ok := objects[classRef].(map[string]interface{})
++	if !ok {
++		return nil, fmt.Errorf("dictionary class is not an object")
++	}
++	name, _ := classObject[className].(string)
++	if name != nsDictionary && name != nsMutableDictionary {
++		return nil, fmt.Errorf("must reference NSDictionary, got class %q", name)
++	}
++	return extractDictionary(dictionary, objects, 0)
++}
++
+ func extractAttachmentPayload(payloadRaw interface{}, objects []interface{}) []uint8 {
+ 	payload, byteSliceOk := payloadRaw.([]uint8)
+ 	if !byteSliceOk {
+diff --git a/ios/openstdio/service.go b/ios/openstdio/service.go
+index 4bc12fd..a82b058 100644
+--- a/ios/openstdio/service.go
++++ b/ios/openstdio/service.go
+@@ -2,6 +2,7 @@
+ package openstdio
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -22,6 +23,10 @@ type Connection struct {
+ // NewOpenStdIoSocket creates a new stdio-socket on the device and the returned connection can be used
+ // to read and write from this socket
+ func NewOpenStdIoSocket(device ios.DeviceEntry) (Connection, error) {
++	return NewOpenStdIoSocketContext(context.Background(), device)
++}
++
++func NewOpenStdIoSocketContext(ctx context.Context, device ios.DeviceEntry) (Connection, error) {
+ 	if device.Rsd == nil {
+ 		return Connection{}, errors.New("NewOpenStdIoSocket: no rsd device found")
+ 	}
+@@ -30,19 +35,25 @@ func NewOpenStdIoSocket(device ios.DeviceEntry) (Connection, error) {
+ 	if err != nil {
+ 		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: %w", err)
+ 	}
+-	conn, err := ios.ConnectTUNDevice(device.Address, port, device)
++	conn, err := ios.ConnectTUNDeviceContext(ctx, device.Address, port, device)
+ 	if err != nil {
+ 		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed to open connection: %w", err)
+ 	}
+ 
++	return readOpenStdIoSocket(conn)
++}
++
++func readOpenStdIoSocket(conn io.ReadWriteCloser) (Connection, error) {
+ 	uuidBytes := make([]byte, 16)
+-	_, err = conn.Read(uuidBytes)
++	_, err := io.ReadFull(conn, uuidBytes)
+ 	if err != nil {
++		conn.Close()
+ 		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed to read UUID: %w", err)
+ 	}
+ 
+ 	u, err := uuid.FromBytes(uuidBytes)
+ 	if err != nil {
++		conn.Close()
+ 		return Connection{}, fmt.Errorf("NewOpenStdIoSocket: failed to parse UUID: %w", err)
+ 	}
+ 
+diff --git a/ios/openstdio/service_test.go b/ios/openstdio/service_test.go
+new file mode 100644
+index 0000000..9a1e118
+--- /dev/null
++++ b/ios/openstdio/service_test.go
+@@ -0,0 +1,46 @@
++package openstdio
++
++import (
++	"bytes"
++	"io"
++	"testing"
++
++	"github.com/google/uuid"
++)
++
++type fragmentedStdio struct {
++	io.Reader
++	closed bool
++}
++
++func (f *fragmentedStdio) Read(p []byte) (int, error) {
++	if len(p) > 3 {
++		p = p[:3]
++	}
++	return f.Reader.Read(p)
++}
++func (f *fragmentedStdio) Write(p []byte) (int, error) { return len(p), nil }
++func (f *fragmentedStdio) Close() error                { f.closed = true; return nil }
++
++func TestOpenStdIoReadsFragmentedUUID(t *testing.T) {
++	id := uuid.New()
++	socket := &fragmentedStdio{Reader: bytes.NewReader(id[:])}
++	connection, err := readOpenStdIoSocket(socket)
++	if err != nil || connection.ID != id {
++		t.Fatalf("fragmented UUID %v: %v", connection.ID, err)
++	}
++	if socket.closed {
++		t.Fatal("valid stdio socket closed")
++	}
++	connection.Close()
++}
++
++func TestOpenStdIoClosesTruncatedUUID(t *testing.T) {
++	socket := &fragmentedStdio{Reader: bytes.NewReader([]byte{1, 2, 3})}
++	if _, err := readOpenStdIoSocket(socket); err == nil {
++		t.Fatal("truncated UUID accepted")
++	}
++	if !socket.closed {
++		t.Fatal("failed stdio socket leaked")
++	}
++}
+diff --git a/ios/remote_test_transport_test.go b/ios/remote_test_transport_test.go
+new file mode 100644
+index 0000000..16f973f
+--- /dev/null
++++ b/ios/remote_test_transport_test.go
+@@ -0,0 +1,92 @@
++package ios
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestRemoteProductVersionUsesAuthenticatedRSD(t *testing.T) {
++	var raw map[string]interface{}
++	if err := json.Unmarshal([]byte(rsdOutput), &raw); err != nil {
++		t.Fatal(err)
++	}
++	rsd, err := parseRsdHandshakeResponse(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	device := DeviceEntry{Address: "fd00::1", Rsd: rsd}
++	version, err := GetProductVersion(device)
++	if err != nil || version.String() != "17.0.3" {
++		t.Fatalf("version %v: %v", version, err)
++	}
++	rsd.OSVersion = ""
++	device.Rsd = rsd
++	if _, err := GetProductVersion(device); err == nil || !strings.Contains(err.Error(), "RSD peer") {
++		t.Fatalf("missing RSD version must fail without usbmuxd: %v", err)
++	}
++	rsd.OSVersion = "not-a-version"
++	device.Rsd = rsd
++	if _, err := GetProductVersion(device); err == nil || !strings.Contains(err.Error(), "invalid RSD") {
++		t.Fatalf("invalid RSD version: %v", err)
++	}
++}
++
++func TestServiceCancellationClosesOnlyOwnedSocket(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	device := DeviceEntry{UserspaceTUN: true, UserspaceTUNHost: "127.0.0.1", UserspaceTUNPort: listener.Addr().(*net.TCPAddr).Port}
++	accepted := make(chan error, 2)
++	go func() {
++		for range 2 {
++			conn, err := listener.Accept()
++			if err != nil {
++				accepted <- err
++				return
++			}
++			go func() {
++				defer conn.Close()
++				_, err := io.ReadFull(conn, make([]byte, 20))
++				accepted <- err
++				io.Copy(io.Discard, conn)
++			}()
++		}
++	}()
++	ctx, cancel := context.WithCancel(context.Background())
++	first, err := ConnectTUNDeviceContext(ctx, "fd00::1", 62000, device)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer first.Close()
++	if err := <-accepted; err != nil {
++		t.Fatal(err)
++	}
++	read := make(chan error, 1)
++	go func() { _, err := first.Read(make([]byte, 1)); read <- err }()
++	cancel()
++	select {
++	case err := <-read:
++		if err == nil {
++			t.Fatal("read succeeded after cancellation")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("cancelled read remained blocked")
++	}
++	secondCtx, secondCancel := context.WithTimeout(context.Background(), time.Second)
++	defer secondCancel()
++	second, err := ConnectTUNDeviceContext(secondCtx, "fd00::1", 62001, device)
++	if err != nil {
++		t.Fatalf("parent forwarder must remain usable: %v", err)
++	}
++	defer second.Close()
++	if err := <-accepted; err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/ios/rsd.go b/ios/rsd.go
+index 5c9e301..5485233 100644
+--- a/ios/rsd.go
++++ b/ios/rsd.go
+@@ -1,10 +1,10 @@
+ package ios
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+-	"net"
+ 	"strconv"
+ 
+ 	"github.com/danielpaulus/go-ios/ios/golog"
+@@ -91,7 +91,7 @@ func (r RsdPortProviderJson) GetServices() (services map[string]RsdServiceEntry)
+ // from the host side
+ func RsdCheckin(rw io.ReadWriter) error {
+ 	req := map[string]interface{}{
+-		"Label":           "go-ios",
++		"Label":           "Link Core",
+ 		"ProtocolVersion": "2",
+ 		"Request":         "RSDCheckin",
+ 	}
+@@ -134,10 +134,14 @@ type RsdServiceEntry struct {
+ // RsdHandshakeResponse is the response to the RSDCheckin request and contains the UDID
+ // and the services available on the device.
+ type RsdHandshakeResponse struct {
+-	Udid     string
+-	Services map[string]RsdServiceEntry
++	Udid      string
++	OSVersion string
++	Services  map[string]RsdServiceEntry
+ }
+ 
++// GetOSVersion returns the version advertised by this authenticated RSD peer.
++func (r RsdHandshakeResponse) GetOSVersion() string { return r.OSVersion }
++
+ // GetService returns the service name for the given port.
+ func (r RsdHandshakeResponse) GetService(p int) string {
+ 	for name, s := range r.Services {
+@@ -153,6 +157,10 @@ func (r RsdHandshakeResponse) GetPort(service string) int {
+ 	if s, ok := r.Services[service]; ok {
+ 		return int(s.Port)
+ 	}
++	shim := fmt.Sprintf("%s.shim.remote", service)
++	if s, ok := r.Services[shim]; ok {
++		return int(s.Port)
++	}
+ 	return 0
+ }
+ 
+@@ -167,7 +175,7 @@ func NewWithAddrPort(addr string, port int) (RsdService, error) {
+ 	if err != nil {
+ 		return RsdService{}, fmt.Errorf("NewWithAddrPort: failed to connect to device: %w", err)
+ 	}
+-	return newRsdServiceFromTcpConn(conn)
++	return newRsdServiceFromConn(conn)
+ }
+ 
+ // NewWithAddrDevice creates a new RsdService with the given address and port 58783 using a HTTP2 based XPC connection.
+@@ -181,18 +189,30 @@ func NewWithAddrPortDevice(addr string, port int, d DeviceEntry) (RsdService, er
+ 	if err != nil {
+ 		return RsdService{}, fmt.Errorf("NewWithAddrPortTUNDevice: failed to connect to device: %w", err)
+ 	}
+-	return newRsdServiceFromTcpConn(conn)
++	return newRsdServiceFromConn(conn)
+ }
+ 
+-func newRsdServiceFromTcpConn(conn *net.TCPConn) (RsdService, error) {
++// NewWithAddrPortDeviceContext binds dialing, HTTP2/XPC startup and RSD reads
++// to ctx. Cancellation closes only this service socket, not its parent tunnel.
++func NewWithAddrPortDeviceContext(ctx context.Context, addr string, port int, d DeviceEntry) (RsdService, error) {
++	conn, err := ConnectTUNDeviceContext(ctx, addr, port, d)
++	if err != nil {
++		return RsdService{}, fmt.Errorf("NewWithAddrPortDeviceContext: failed to connect: %w", err)
++	}
++	return newRsdServiceFromConn(conn)
++}
++
++func newRsdServiceFromConn(conn io.ReadWriteCloser) (RsdService, error) {
+ 	h, err := http.NewHttpConnection(conn)
+ 	if err != nil {
+-		return RsdService{}, fmt.Errorf("newRsdServiceFromTcpConn: failed to connect to http2: %w", err)
++		_ = conn.Close()
++		return RsdService{}, fmt.Errorf("newRsdServiceFromConn: failed to connect to http2: %w", err)
+ 	}
+ 
+ 	x, err := CreateXpcConnection(h)
+ 	if err != nil {
+-		return RsdService{}, fmt.Errorf("newRsdServiceFromTcpConn: failed to create xpc connection: %w", err)
++		_ = h.Close()
++		return RsdService{}, fmt.Errorf("newRsdServiceFromConn: failed to create xpc connection: %w", err)
+ 	}
+ 
+ 	return RsdService{
+@@ -209,8 +229,14 @@ func (s RsdService) Handshake() (RsdHandshakeResponse, error) {
+ 	if err != nil {
+ 		return RsdHandshakeResponse{}, fmt.Errorf("Handshake: failed to receive handshake response. %w", err)
+ 	}
++	return parseRsdHandshakeResponse(m)
++}
++
++func parseRsdHandshakeResponse(m map[string]interface{}) (RsdHandshakeResponse, error) {
+ 	udid := ""
++	osVersion := ""
+ 	if properties, ok := m["Properties"].(map[string]interface{}); ok {
++		osVersion, _ = properties["OSVersion"].(string)
+ 		if u, ok := properties["UniqueDeviceID"].(string); ok {
+ 			udid = u
+ 		}
+@@ -232,8 +258,9 @@ func (s RsdService) Handshake() (RsdHandshakeResponse, error) {
+ 			}
+ 		}
+ 		return RsdHandshakeResponse{
+-			Services: res,
+-			Udid:     udid,
++			Services:  res,
++			Udid:      udid,
++			OSVersion: osVersion,
+ 		}, nil
+ 	} else {
+ 		return RsdHandshakeResponse{}, fmt.Errorf("Handshake: unknown response")
+diff --git a/ios/rsd_test.go b/ios/rsd_test.go
+index 5d69ad1..7f5e691 100644
+--- a/ios/rsd_test.go
++++ b/ios/rsd_test.go
+@@ -29,6 +29,13 @@ func TestGetServiceSkipsUnparseablePort(t *testing.T) {
+ 	assert.Equal(t, "com.apple.working", rsd.GetService(50340))
+ }
+ 
++func TestRsdHandshakeResponseFallsBackToShim(t *testing.T) {
++	rsd := RsdHandshakeResponse{Services: map[string]RsdServiceEntry{
++		"com.apple.mobile.installation_proxy.shim.remote": {Port: 62000},
++	}}
++	assert.Equal(t, 62000, rsd.GetPort("com.apple.mobile.installation_proxy"))
++}
++
+ const rsdOutput = `
+ {
+   "MessageType": "Handshake",
+diff --git a/ios/testmanagerd/proxydispatcher.go b/ios/testmanagerd/proxydispatcher.go
+index a1c02f3..143d422 100644
+--- a/ios/testmanagerd/proxydispatcher.go
++++ b/ios/testmanagerd/proxydispatcher.go
+@@ -19,6 +19,14 @@ type proxyDispatcher struct {
+ }
+ 
+ func (p proxyDispatcher) Dispatch(m dtx.Message) {
++	if p.testListener != nil {
++		p.testListener.mu.Lock()
++		defer p.testListener.mu.Unlock()
++		if p.testListener.sealed {
++			dtx.SendAckIfNeeded(p.dtxConnection, m)
++			return
++		}
++	}
+ 	var dispatcher = &p
+ 	defer func() {
+ 		if r := recover(); r != nil {
+diff --git a/ios/testmanagerd/remote_lifecycle_test.go b/ios/testmanagerd/remote_lifecycle_test.go
+new file mode 100644
+index 0000000..4444b9e
+--- /dev/null
++++ b/ios/testmanagerd/remote_lifecycle_test.go
+@@ -0,0 +1,92 @@
++package testmanagerd
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"os"
++	"sync"
++	"testing"
++
++	"github.com/danielpaulus/go-ios/ios/nskeyedarchiver"
++)
++
++func TestRunnerAndDTXLogsShareSynchronization(t *testing.T) {
++	var output bytes.Buffer
++	listener := NewTestListener(&output, &output, t.TempDir())
++	var done sync.WaitGroup
++	for range 10 {
++		done.Go(func() {
++			for range 10 {
++				listener.logWriter.Write([]byte("stdout\n"))
++				listener.LogMessage("event\n")
++				listener.LogDebugMessage("debug\n")
++			}
++		})
++	}
++	done.Wait()
++	if bytes.Count(output.Bytes(), []byte("\n")) != 300 {
++		t.Fatal("concurrent output was lost")
++	}
++}
++
++func TestCancelledRunNeverStartsDeviceDiscovery(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := RunTestWithConfig(ctx, TestConfig{}); !errors.Is(err, context.Canceled) {
++		t.Fatalf("cancellation lost: %v", err)
++	}
++}
++
++func TestRejectedTestSessionIsFailure(t *testing.T) {
++	if err := requireAuthorizedTestSession(false); err == nil {
++		t.Fatal("rejected test runner accepted")
++	}
++}
++
++func TestCompletedSuiteAcceptsLateAttachmentAndSnapshotIsDetached(t *testing.T) {
++	listener := NewTestListener(nil, nil, t.TempDir())
++	listener.TestSuites = []TestSuite{{Name: "Capture", TestCases: []TestCase{{ClassName: "Capture", MethodName: "testCapture", Status: StatusPassed}}}}
++	listener.testCaseFinished("Capture", "testCapture", nskeyedarchiver.XCActivityRecord{Attachments: []nskeyedarchiver.XCTAttachment{{Name: "capture", Payload: []byte("PNG")}}})
++	suites, err := listener.resultSnapshot()
++	if err != nil || len(suites[0].TestCases[0].Attachments) != 1 {
++		t.Fatalf("late attachment missing: %+v %v", suites, err)
++	}
++	attachment := suites[0].TestCases[0].Attachments[0]
++	if data, err := os.ReadFile(attachment.Path); err != nil || string(data) != "PNG" {
++		t.Fatalf("attachment not flushed: %q %v", data, err)
++	}
++	listener.TestSuites[0].TestCases[0].Attachments[0].Name = "mutated"
++	if attachment.Name != "capture" || suites[0].TestCases[0].Attachments[0].Name != "capture" {
++		t.Fatal("snapshot aliases listener storage")
++	}
++	listener.FinishWithError(context.Canceled)
++	if listener.err != nil {
++		t.Fatal("sealed result mutated by late cancellation")
++	}
++}
++
++func TestNestedParentCompletionPreservesPassedCaseAndLateAttachment(t *testing.T) {
++	listener := NewTestListener(nil, nil, t.TempDir())
++	date := "2026-09-09 18:52:57 +0000"
++	listener.testSuiteDidStart("Selected tests", date)
++	listener.testSuiteDidStart("Capture", date)
++	listener.testCaseDidStartForClass("Capture", "testCapture")
++	listener.testCaseDidFinishForTest("Capture", "testCapture", "passed", 1)
++	listener.testSuiteFinished("Capture", date, 1, 0, 0, 0, 0, 0, 1, 1)
++	// iOS emits the enclosing suite completion after the leaf suite has ended.
++	listener.testSuiteFinished("Selected tests", date, 1, 0, 0, 0, 0, 0, 1, 1)
++	listener.testCaseFinished("Capture", "testCapture", nskeyedarchiver.XCActivityRecord{Attachments: []nskeyedarchiver.XCTAttachment{{Name: "late", Payload: []byte("PNG")}}})
++	listener.didFinishExecutingTestPlan()
++	suites, err := listener.resultSnapshot()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(suites) != 2 || len(suites[1].TestCases) != 1 {
++		t.Fatalf("unexpected nested results: %+v", suites)
++	}
++	test := suites[1].TestCases[0]
++	if test.Status != StatusPassed || len(test.Attachments) != 1 || test.Attachments[0].Name != "late" {
++		t.Fatalf("leaf evidence changed: %+v", test)
++	}
++}
+diff --git a/ios/testmanagerd/testlistener.go b/ios/testmanagerd/testlistener.go
+index 321bb91..7daec63 100644
+--- a/ios/testmanagerd/testlistener.go
++++ b/ios/testmanagerd/testlistener.go
+@@ -17,6 +17,8 @@ import (
+ 
+ // TestListener collects test results from the test execution
+ type TestListener struct {
++	mu                   sync.Mutex
++	sealed               bool
+ 	finished             chan struct{}
+ 	finishedOnce         sync.Once
+ 	err                  error
+@@ -79,6 +81,9 @@ func NewTestListener(logWriter io.Writer, debugLogWriter io.Writer, attachmentsD
+ 	if debugLogWriter == nil {
+ 		debugLogWriter = io.Discard
+ 	}
++	var logMu sync.Mutex
++	logWriter = synchronizedTestWriter{mu: &logMu, writer: logWriter}
++	debugLogWriter = synchronizedTestWriter{mu: &logMu, writer: debugLogWriter}
+ 	return &TestListener{
+ 		finished:             make(chan struct{}),
+ 		logWriter:            logWriter,
+@@ -123,13 +128,15 @@ func (t *TestListener) testCaseStalled(testClass string, method string, file str
+ }
+ 
+ func (t *TestListener) testCaseFinished(testClass string, testMethod string, xcActivityRecord nskeyedarchiver.XCActivityRecord) {
+-	ts := t.findTestSuite(testClass)
+ 	testCase := t.findTestCase(testClass, testMethod)
+-	if ts == nil || testCase == nil || testClass == "none" || testMethod == "none" {
++	if testCase == nil || testClass == "none" || testMethod == "none" {
+ 		// Attachments of activity records are reported under a special test class named "none"
+ 		// That's unfortunately the default behavior defined by Apple.
+ 		// This if block is a safe guard to auto correct the test case information
+-		ts = t.runningTestSuite
++		ts := t.runningTestSuite
++		if ts == nil && len(t.TestSuites) > 0 {
++			ts = &t.TestSuites[len(t.TestSuites)-1]
++		}
+ 		if ts == nil {
+ 			golog.Debug("testCaseFinished without a running test suite", "module", logModule, "testClass", testClass, "testMethod", testMethod)
+ 			return
+@@ -311,11 +318,15 @@ func (t *TestListener) LogDebugMessage(msg string) {
+ }
+ 
+ func (t *TestListener) TestRunnerKilled() {
+-	t.err = errors.New("Test runner has been explicitly killed.")
+-	t.executionFinished()
++	t.FinishWithError(errors.New("Test runner has been explicitly killed."))
+ }
+ 
+ func (t *TestListener) FinishWithError(err error) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.sealed {
++		return
++	}
+ 	if t.runningTestSuite != nil {
+ 		t.TestSuites = append(t.TestSuites, *t.runningTestSuite)
+ 		t.runningTestSuite = nil
+@@ -348,16 +359,23 @@ func (t *TestListener) findTestCase(className string, methodName string) *TestCa
+ 		}
+ 	}
+ 
++	for i := len(t.TestSuites) - 1; i >= 0; i-- {
++		for j := len(t.TestSuites[i].TestCases) - 1; j >= 0; j-- {
++			test := &t.TestSuites[i].TestCases[j]
++			if test.ClassName == className && test.MethodName == methodName {
++				return test
++			}
++		}
++	}
+ 	return nil
+ }
+ 
++// Lifecycle transitions only target the active suite. Completed suites are
++// searched by findTestCase for late attachments, never reopened for completion.
+ func (t *TestListener) findTestSuite(className string) *TestSuite {
+-	if t.runningTestSuite != nil {
+-		if t.runningTestSuite.Name == className {
+-			return t.runningTestSuite
+-		}
++	if t.runningTestSuite != nil && t.runningTestSuite.Name == className {
++		return t.runningTestSuite
+ 	}
+-
+ 	return nil
+ }
+ 
+@@ -368,6 +386,9 @@ func (t *TestListener) executionFinished() {
+ }
+ 
+ func (t *TestListener) reset() {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.sealed = false
+ 	// Reinitialize finished channel to allow signaling again
+ 	t.finished = make(chan struct{})
+ 
+@@ -383,3 +404,31 @@ func (t *TestListener) reset() {
+ 	// Clear the reference to the running test suite
+ 	t.runningTestSuite = nil
+ }
++
++// resultSnapshot seals callbacks after the final test-plan event and returns
++// detached slices, so daemon serialization never races a DTX reader.
++func (t *TestListener) resultSnapshot() ([]TestSuite, error) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	t.sealed = true
++	suites := append([]TestSuite(nil), t.TestSuites...)
++	for i := range suites {
++		suites[i].TestCases = append([]TestCase(nil), suites[i].TestCases...)
++		for j := range suites[i].TestCases {
++			suites[i].TestCases[j].Attachments = append([]TestAttachment(nil), suites[i].TestCases[j].Attachments...)
++		}
++	}
++	return suites, t.err
++}
++
++// DTX callbacks and runner stdio may write the same destination concurrently.
++type synchronizedTestWriter struct {
++	mu     *sync.Mutex
++	writer io.Writer
++}
++
++func (w synchronizedTestWriter) Write(data []byte) (int, error) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	return w.writer.Write(data)
++}
+diff --git a/ios/testmanagerd/xcuitestrunner.go b/ios/testmanagerd/xcuitestrunner.go
+index 287d5d5..4adb54b 100644
+--- a/ios/testmanagerd/xcuitestrunner.go
++++ b/ios/testmanagerd/xcuitestrunner.go
+@@ -9,6 +9,7 @@ import (
+ 	"maps"
+ 	"path"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/Masterminds/semver"
+ 	"github.com/danielpaulus/go-ios/ios/afc"
+@@ -320,7 +321,18 @@ func StartXCTestWithConfig(ctx context.Context, xctestrunFilePath string, device
+ 	return results, errors.Join(targetErrors...)
+ }
+ 
+-func RunTestWithConfig(ctx context.Context, testConfig TestConfig) ([]TestSuite, error) {
++func RunTestWithConfig(ctx context.Context, testConfig TestConfig) (suites []TestSuite, runErr error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if testConfig.Listener == nil {
++		return nil, errors.New("RunTestWithConfig: listener is required")
++	}
++	defer func() {
++		if ctx.Err() != nil {
++			runErr = errors.Join(runErr, ctx.Err())
++		}
++	}()
+ 	if len(testConfig.TestRunnerBundleId) == 0 {
+ 		return nil, fmt.Errorf("RunTestWithConfig: testConfig.TestRunnerBundleId can not be empty")
+ 	}
+@@ -348,19 +360,22 @@ func runXUITestWithBundleIdsXcode15Ctx(
+ 	config TestConfig,
+ 	version *semver.Version,
+ ) ([]TestSuite, error) {
+-	conn1, err := dtx.NewTunnelConnection(config.Device, testmanagerdiOS17)
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	defer config.Listener.resultSnapshot()
++	conn1, err := dtx.NewTunnelConnectionContext(ctx, config.Device, testmanagerdiOS17)
+ 	if err != nil {
+ 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot create a tunnel connection to testmanagerd: %w", err)
+ 	}
+ 	defer conn1.Close()
+ 
+-	conn2, err := dtx.NewTunnelConnection(config.Device, testmanagerdiOS17)
++	conn2, err := dtx.NewTunnelConnectionContext(ctx, config.Device, testmanagerdiOS17)
+ 	if err != nil {
+ 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot create a tunnel connection to testmanagerd: %w", err)
+ 	}
+ 	defer conn2.Close()
+ 
+-	installationProxy, err := installationproxy.New(config.Device)
++	installationProxy, err := installationproxy.NewWithContext(ctx, config.Device)
+ 	if err != nil {
+ 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot connect to installation proxy: %w", err)
+ 	}
+@@ -410,7 +425,7 @@ func runXUITestWithBundleIdsXcode15Ctx(
+ 	}
+ 	golog.Info("got capabilities", "module", logModule, "udid", config.Device.Properties.SerialNumber, "receivedCaps", receivedCaps)
+ 
+-	appserviceConn, err := appservice.New(config.Device)
++	appserviceConn, err := appservice.NewWithContext(ctx, config.Device)
+ 	if err != nil {
+ 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot connect to app service: %w", err)
+ 	}
+@@ -421,8 +436,14 @@ func runXUITestWithBundleIdsXcode15Ctx(
+ 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot start test runner: %w", err)
+ 	}
+ 
+-	defer testRunnerLaunch.Close()
++	defer stopRemoteTestRunner(config.Device, testRunnerLaunch.Pid)
++	logDone := make(chan struct{})
++	defer func() {
++		testRunnerLaunch.Close()
++		<-logDone
++	}()
+ 	go func() {
++		defer close(logDone)
+ 		_, err := io.Copy(config.Listener.logWriter, testRunnerLaunch)
+ 		if err != nil {
+ 			golog.Warn("copying stdout failed", "module", logModule, "udid", config.Device.Properties.SerialNumber, "error", err)
+@@ -439,10 +460,16 @@ func runXUITestWithBundleIdsXcode15Ctx(
+ 	if err != nil {
+ 		return make([]TestSuite, 0), fmt.Errorf("runXUITestWithBundleIdsXcode15Ctx: cannot authorize test session: %w", err)
+ 	}
++	if err := requireAuthorizedTestSession(authorized); err != nil {
++		return nil, err
++	}
+ 	golog.Info("authorized", "module", logModule, "udid", config.Device.Properties.SerialNumber, "pid", testRunnerLaunch.Pid, "authorized", authorized)
+ 
+-	ideInterfaceChannel := ideDaemonProxy1.dtxConnection.ForChannelRequest(proxyDispatcher{id: "dtxproxy:XCTestDriverInterface:XCTestManager_IDEInterface", testListener: noopTestListener()})
++	ideInterfaceChannel, err := ideDaemonProxy1.dtxConnection.ForChannelRequestContext(ctx, proxyDispatcher{id: "dtxproxy:XCTestDriverInterface:XCTestManager_IDEInterface", testListener: noopTestListener()})
+ 
++	if err != nil {
++		return nil, fmt.Errorf("waiting for XCTest driver channel: %w", err)
++	}
+ 	proto := uint64(36)
+ 	err = ideDaemonProxy1.daemonConnection.startExecutingTestPlanWithProtocolVersion(ideInterfaceChannel, proto)
+ 	if err != nil {
+@@ -467,19 +494,35 @@ func runXUITestWithBundleIdsXcode15Ctx(
+ 	case <-config.Listener.Done():
+ 		break
+ 	case <-ctx.Done():
++		config.Listener.FinishWithError(ctx.Err())
+ 		break
+ 	}
+-	golog.Info("Killing test runner", "module", logModule, "udid", config.Device.Properties.SerialNumber, "pid", testRunnerLaunch.Pid)
+-	err = killTestRunner(appserviceConn, testRunnerLaunch.Pid)
+-	if err != nil {
+-		golog.Info("Nothing to kill, process is already dead", "module", logModule, "udid", config.Device.Properties.SerialNumber, "pid", testRunnerLaunch.Pid)
+-	} else {
+-		golog.Info("Test runner killed with success", "module", logModule, "udid", config.Device.Properties.SerialNumber)
+-	}
+-
+ 	golog.Debug("Done running test", "module", logModule, "udid", config.Device.Properties.SerialNumber)
+ 
+-	return config.Listener.TestSuites, config.Listener.err
++	return config.Listener.resultSnapshot()
++}
++
++func requireAuthorizedTestSession(authorized bool) error {
++	if !authorized {
++		return errors.New("testmanagerd rejected authorization for the test runner")
++	}
++	return nil
++}
++
++// Cleanup has its own short lifetime because the run context may be cancelled.
++// It opens only a service socket on the existing tunnel; it never reacquires pairing.
++func stopRemoteTestRunner(device ios.DeviceEntry, pid int) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	service, err := appservice.NewWithContext(ctx, device)
++	if err != nil {
++		golog.Warn("test runner cleanup connection failed", "module", logModule, "error", err)
++		return
++	}
++	defer service.Close()
++	if err := killTestRunner(service, pid); err != nil {
++		golog.Debug("test runner cleanup did not kill a process", "module", logModule, "error", err)
++	}
+ }
+ 
+ type processKiller interface {
+diff --git a/ios/tunnel/codec.go b/ios/tunnel/codec.go
+index c821983..6fa94b7 100644
+--- a/ios/tunnel/codec.go
++++ b/ios/tunnel/codec.go
+@@ -2,6 +2,7 @@ package tunnel
+ 
+ import (
+ 	"crypto/cipher"
++	"encoding/base64"
+ 	"encoding/binary"
+ 	"encoding/json"
+ 	"fmt"
+@@ -37,7 +38,11 @@ func (p *pairingData) Decode(e map[string]interface{}) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	if data, ok := pd["data"].([]byte); ok {
++	if raw, ok := pd["data"]; ok {
++		data, err := decodeWireBytes(raw)
++		if err != nil {
++			return fmt.Errorf("pairingData.Decode: invalid data: %w", err)
++		}
+ 		p.data = data
+ 	}
+ 	if kind, ok := pd["kind"].(string); ok {
+@@ -52,6 +57,21 @@ func (p *pairingData) Decode(e map[string]interface{}) error {
+ 	return nil
+ }
+ 
++func decodeWireBytes(value interface{}) ([]byte, error) {
++	switch value := value.(type) {
++	case []byte:
++		return value, nil
++	case string:
++		decoded, err := base64.StdEncoding.DecodeString(value)
++		if err != nil {
++			return nil, err
++		}
++		return decoded, nil
++	default:
++		return nil, fmt.Errorf("expected bytes or base64 string, got %T", value)
++	}
++}
++
+ type pairVerifyFailed struct {
+ }
+ 
+@@ -222,13 +242,15 @@ func (c *cipherStream) read(p *map[string]interface{}) error {
+ 		return err
+ 	}
+ 	if streamEncr, err := getChildMap(m, "streamEncrypted"); err == nil {
+-		if cip, ok := streamEncr["_0"].([]byte); ok {
+-			plain, err := c.serverCipher.Open(nil, c.nonce, cip, nil)
+-			if err != nil {
+-				return err
+-			}
+-			return json.Unmarshal(plain, p)
++		cip, err := decodeWireBytes(streamEncr["_0"])
++		if err != nil {
++			return err
++		}
++		plain, err := c.serverCipher.Open(nil, c.nonce, cip, nil)
++		if err != nil {
++			return err
+ 		}
++		return json.Unmarshal(plain, p)
+ 	}
+ 	return fmt.Errorf("not implemented")
+ }
+diff --git a/ios/tunnel/pair_verify_identity_test.go b/ios/tunnel/pair_verify_identity_test.go
+new file mode 100644
+index 0000000..f6d99d5
+--- /dev/null
++++ b/ios/tunnel/pair_verify_identity_test.go
+@@ -0,0 +1,150 @@
++package tunnel
++
++import (
++	"crypto/ecdh"
++	"crypto/rand"
++	"crypto/sha512"
++	"fmt"
++	"golang.org/x/crypto/chacha20poly1305"
++	"golang.org/x/crypto/ed25519"
++	"golang.org/x/crypto/hkdf"
++	"testing"
++)
++
++type identityPeer struct {
++	key     *ecdh.PrivateKey
++	signing ed25519.PrivateKey
++	kind    string
++	writes  int
++	reply   map[string]interface{}
++}
++
++func identityEnvelope(p pairingData) map[string]interface{} {
++	return map[string]interface{}{"value": map[string]interface{}{"message": map[string]interface{}{"plain": map[string]interface{}{"_0": map[string]interface{}{"event": map[string]interface{}{"_0": p.Encode()}}}}}}
++}
++func (p *identityPeer) Send(message map[string]interface{}, _ ...uint32) error {
++	p.writes++
++	if p.writes != 1 {
++		tlv := newTlvBuffer()
++		tlv.writeByte(typeState, pairStateVerifyResponse)
++		p.reply = identityEnvelope(pairingData{data: tlv.bytes(), kind: "verifyManualPairing"})
++		return nil
++	}
++	m, err := getChildMap(message, "value", "message", "plain", "_0", "event", "_0")
++	if err != nil {
++		return err
++	}
++	var host pairingData
++	if err = host.Decode(m); err != nil {
++		return err
++	}
++	hostBytes, err := tlvReader(host.data).readCoalesced(typePublicKey)
++	if err != nil {
++		return err
++	}
++	hostKey, err := ecdh.X25519().NewPublicKey(hostBytes)
++	if err != nil {
++		return err
++	}
++	shared, err := p.key.ECDH(hostKey)
++	if err != nil {
++		return err
++	}
++	derived := make([]byte, 32)
++	if _, err = hkdf.New(sha512.New, shared, []byte("Pair-Verify-Encrypt-Salt"), []byte("Pair-Verify-Encrypt-Info")).Read(derived); err != nil {
++		return err
++	}
++	ci, err := chacha20poly1305.New(derived)
++	if err != nil {
++		return err
++	}
++	id := []byte("test-device-identity")
++	if p.kind == "identifier" {
++		id = []byte("other-device")
++	}
++	transcript := append(append(append([]byte{}, p.key.PublicKey().Bytes()...), id...), hostBytes...)
++	signature := ed25519.Sign(p.signing, transcript)
++	if p.kind == "signature" {
++		signature[0] ^= 1
++	}
++	proof := newTlvBuffer()
++	proof.writeData(typeIdentifier, id)
++	proof.writeData(typeSignature, signature)
++	nonce := make([]byte, 12)
++	copy(nonce[4:], "PV-Msg02")
++	encrypted := ci.Seal(nil, nonce, proof.bytes(), nil)
++	if p.kind == "ciphertext" {
++		encrypted[0] ^= 1
++	}
++	tlv := newTlvBuffer()
++	tlv.writeByte(typeState, pairStateStartResponse)
++	tlv.writeData(typePublicKey, p.key.PublicKey().Bytes())
++	if p.kind != "unsigned" {
++		tlv.writeData(typeEncryptedData, encrypted)
++	}
++	if p.kind == "state" {
++		tlv = newTlvBuffer()
++		tlv.writeByte(typeState, 4)
++		tlv.writeData(typePublicKey, p.key.PublicKey().Bytes())
++		tlv.writeData(typeEncryptedData, encrypted)
++	}
++	p.reply = identityEnvelope(pairingData{data: tlv.bytes(), kind: "verifyManualPairing"})
++	return nil
++}
++func (p *identityPeer) ReceiveOnClientServerStream() (map[string]interface{}, error) {
++	if p.reply == nil {
++		return nil, fmt.Errorf("no reply")
++	}
++	return p.reply, nil
++}
++func TestPairVerifyPinnedDeviceIdentity(t *testing.T) {
++	for _, kind := range []string{"valid", "unsigned", "signature", "ciphertext", "identifier", "state", "wrong-pin", "missing-pin"} {
++		t.Run(kind, func(t *testing.T) {
++			devicePub, devicePrivate, err := ed25519.GenerateKey(rand.Reader)
++			if err != nil {
++				t.Fatal(err)
++			}
++			hostPub, hostPrivate, err := ed25519.GenerateKey(rand.Reader)
++			if err != nil {
++				t.Fatal(err)
++			}
++			eph, err := ecdh.X25519().GenerateKey(rand.Reader)
++			if err != nil {
++				t.Fatal(err)
++			}
++			peer := &identityPeer{key: eph, signing: devicePrivate, kind: kind}
++			pinned := devicePub
++			if kind == "wrong-pin" {
++				pinned, _, err = ed25519.GenerateKey(rand.Reader)
++				if err != nil {
++					t.Fatal(err)
++				}
++			}
++			if kind == "missing-pin" {
++				pinned = nil
++			}
++			svc := &tunnelService{controlChannel: newControlChannelReadWriter(peer), pairRecords: PairRecordManager{peerPublicKey: pinned, peerIdentifier: "test-device-identity", selfId: selfIdentity{Identifier: "test-host", PrivateKey: hostPrivate.Seed(), PublicKey: hostPub}}}
++			err = svc.verifyPair()
++			if kind == "valid" {
++				if err != nil || svc.cipher == nil {
++					t.Fatalf("valid peer failed: %v", err)
++				}
++			} else {
++				if err == nil {
++					t.Fatal("invalid peer accepted")
++				}
++				if peer.writes > 1 {
++					t.Fatal("host identity signature released before authentication")
++				}
++				if svc.cipher != nil {
++					t.Fatal("session initialized for invalid peer")
++				}
++			}
++		})
++	}
++}
++func TestTLVTruncatedHeaderRejected(t *testing.T) {
++	if _, err := tlvReader([]byte{byte(typeSignature)}).readCoalesced(typeSignature); err == nil {
++		t.Fatal("truncated header accepted")
++	}
++}
+diff --git a/ios/tunnel/pairrecord.go b/ios/tunnel/pairrecord.go
+index 14c6c4d..fda68b5 100644
+--- a/ios/tunnel/pairrecord.go
++++ b/ios/tunnel/pairrecord.go
+@@ -1,6 +1,7 @@
+ package tunnel
+ 
+ import (
++	"bytes"
+ 	"crypto/rand"
+ 	"errors"
+ 	"fmt"
+@@ -37,11 +38,22 @@ type device struct {
+ 	PublicKey  []byte `plist:"publicKey"`
+ }
+ 
++type pymobiledevice3PairRecord struct {
++	PeerIdentifier string `plist:"peer_identifier"`
++	PeerPublicKey  []byte `plist:"peer_public_key"`
++	HostIdentifier string `plist:"host_identifier"`
++	HostAltIRK     []byte `plist:"host_alt_irk"`
++	PrivateKey     []byte `plist:"private_key"`
++	PublicKey      []byte `plist:"public_key"`
++}
++
+ // PairRecordManager implements the same logic as macOS related to remote pair records. Those pair records are used
+ // whenever a tunnel gets created.
+ type PairRecordManager struct {
+-	selfId        selfIdentity
+-	peersLocation string
++	peerIdentifier string
++	peerPublicKey  ed25519.PublicKey
++	selfId         selfIdentity
++	peersLocation  string
+ }
+ 
+ // NewPairRecordManager creates a PairRecordManager that reads/stores the pair records information at the given path
+@@ -59,6 +71,42 @@ func NewPairRecordManager(p string) (PairRecordManager, error) {
+ 	}, nil
+ }
+ 
++// NewPairRecordManagerFromPymobiledevice3 reuses an existing pymobiledevice3
++// RemotePairing identity without copying the private key to Link Core storage.
++// The two projects use the same Ed25519 controller identity with different
++// plist field names.
++func NewPairRecordManagerFromPymobiledevice3(recordPath string) (PairRecordManager, error) {
++	content, err := os.ReadFile(recordPath)
++	if err != nil {
++		return PairRecordManager{}, fmt.Errorf("NewPairRecordManagerFromPymobiledevice3: failed to read record: %w", err)
++	}
++	var record pymobiledevice3PairRecord
++	if _, err := plist.Unmarshal(content, &record); err != nil {
++		return PairRecordManager{}, fmt.Errorf("NewPairRecordManagerFromPymobiledevice3: failed to parse record: %w", err)
++	}
++	if record.HostIdentifier == "" || len(record.HostAltIRK) != 16 || len(record.PrivateKey) != ed25519.SeedSize || len(record.PublicKey) != ed25519.PublicKeySize {
++		return PairRecordManager{}, fmt.Errorf("NewPairRecordManagerFromPymobiledevice3: incomplete remote pairing identity")
++	}
++	if record.PeerIdentifier == "" || len(record.PeerPublicKey) != ed25519.PublicKeySize {
++		return PairRecordManager{}, fmt.Errorf("NewPairRecordManagerFromPymobiledevice3: trusted USB device identity pin is missing")
++	}
++	derivedPublicKey := ed25519.NewKeyFromSeed(record.PrivateKey)[ed25519.SeedSize:]
++	if !bytes.Equal(derivedPublicKey, record.PublicKey) {
++		return PairRecordManager{}, fmt.Errorf("NewPairRecordManagerFromPymobiledevice3: public and private keys do not match")
++	}
++	return PairRecordManager{
++		peerIdentifier: record.PeerIdentifier,
++		peerPublicKey:  record.PeerPublicKey,
++		selfId: selfIdentity{
++			Identifier: record.HostIdentifier,
++			Irk:        record.HostAltIRK,
++			PrivateKey: record.PrivateKey,
++			PublicKey:  record.PublicKey,
++		},
++		peersLocation: path.Join(path.Dir(recordPath), "link-core-peers"),
++	}, nil
++}
++
+ // StoreDeviceInfo stores the provided Device info as a plist encoded file in the `peers/` directory
+ func (p PairRecordManager) StoreDeviceInfo(d device) error {
+ 	devicePath := path.Join(p.peersLocation, fmt.Sprintf("%s.plist", d.Identifier))
+diff --git a/ios/tunnel/pairrecord_test.go b/ios/tunnel/pairrecord_test.go
+index 7737a80..f489135 100644
+--- a/ios/tunnel/pairrecord_test.go
++++ b/ios/tunnel/pairrecord_test.go
+@@ -1,6 +1,7 @@
+ package tunnel
+ 
+ import (
++	"crypto/rand"
+ 	"os"
+ 	"path"
+ 	"testing"
+@@ -36,3 +37,48 @@ func TestPairRecordManager(t *testing.T) {
+ 		assert.True(t, private.Equal(pm.selfId.privateKey()))
+ 	})
+ }
++
++func TestPairRecordManagerFromPymobiledevice3(t *testing.T) {
++	tmp := t.TempDir()
++	pub, private, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	record := pymobiledevice3PairRecord{
++		PeerIdentifier: "test-device",
++		PeerPublicKey:  make([]byte, 32),
++		HostIdentifier: "A4EF18F4-2920-4ECD-9F32-94719A9B92A9",
++		HostAltIRK:     make([]byte, 16),
++		PrivateKey:     private.Seed(),
++		PublicKey:      pub,
++	}
++	encoded, err := plist.Marshal(record, plist.BinaryFormat)
++	require.NoError(t, err)
++	recordPath := path.Join(tmp, "remote.plist")
++	require.NoError(t, os.WriteFile(recordPath, encoded, 0o600))
++
++	manager, err := NewPairRecordManagerFromPymobiledevice3(recordPath)
++	require.NoError(t, err)
++	assert.Equal(t, record.HostIdentifier, manager.selfId.Identifier)
++	assert.Equal(t, record.PrivateKey, manager.selfId.PrivateKey)
++	assert.Equal(t, record.PublicKey, manager.selfId.PublicKey)
++}
++
++func TestPairRecordManagerFromPymobiledevice3RejectsMismatchedKeys(t *testing.T) {
++	tmp := t.TempDir()
++	_, private, err := ed25519.GenerateKey(rand.Reader)
++	require.NoError(t, err)
++	record := pymobiledevice3PairRecord{
++		PeerIdentifier: "test-device",
++		PeerPublicKey:  make([]byte, 32),
++		HostIdentifier: "A4EF18F4-2920-4ECD-9F32-94719A9B92A9",
++		HostAltIRK:     make([]byte, 16),
++		PrivateKey:     private.Seed(),
++		PublicKey:      make([]byte, ed25519.PublicKeySize),
++	}
++	encoded, err := plist.Marshal(record, plist.BinaryFormat)
++	require.NoError(t, err)
++	recordPath := path.Join(tmp, "remote.plist")
++	require.NoError(t, os.WriteFile(recordPath, encoded, 0o600))
++
++	_, err = NewPairRecordManagerFromPymobiledevice3(recordPath)
++	require.ErrorContains(t, err, "public and private keys do not match")
++}
+diff --git a/ios/tunnel/remote_pairing_raw.go b/ios/tunnel/remote_pairing_raw.go
+new file mode 100644
+index 0000000..b516094
+--- /dev/null
++++ b/ios/tunnel/remote_pairing_raw.go
+@@ -0,0 +1,72 @@
++package tunnel
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++)
++
++const remotePairingPacketMagic = "RPPairing"
++
++// remotePairingRawConn adapts the TCP RemotePairing listener to the xpcConn
++// shape consumed by controlChannelReadWriter. The raw listener carries the
++// envelope value as JSON framed by "RPPairing" and a big-endian uint16 length;
++// the RSD untrusted service carries the same value inside RemoteXPC.
++type remotePairingRawConn struct {
++	conn net.Conn
++}
++
++func newRemotePairingRawConn(conn net.Conn) *remotePairingRawConn {
++	return &remotePairingRawConn{conn: conn}
++}
++
++func (r *remotePairingRawConn) Send(data map[string]interface{}, _ ...uint32) error {
++	value, ok := data["value"].(map[string]interface{})
++	if !ok {
++		return fmt.Errorf("remotePairingRawConn.Send: missing envelope value")
++	}
++	body, err := json.Marshal(value)
++	if err != nil {
++		return fmt.Errorf("remotePairingRawConn.Send: failed to encode JSON: %w", err)
++	}
++	if len(body) > int(^uint16(0)) {
++		return fmt.Errorf("remotePairingRawConn.Send: payload exceeds uint16 framing")
++	}
++
++	var packet bytes.Buffer
++	packet.WriteString(remotePairingPacketMagic)
++	if err := binary.Write(&packet, binary.BigEndian, uint16(len(body))); err != nil {
++		return err
++	}
++	packet.Write(body)
++	if _, err := io.Copy(r.conn, &packet); err != nil {
++		return fmt.Errorf("remotePairingRawConn.Send: failed to write packet: %w", err)
++	}
++	return nil
++}
++
++func (r *remotePairingRawConn) ReceiveOnClientServerStream() (map[string]interface{}, error) {
++	magic := make([]byte, len(remotePairingPacketMagic))
++	if _, err := io.ReadFull(r.conn, magic); err != nil {
++		return nil, fmt.Errorf("remotePairingRawConn.Receive: failed to read magic: %w", err)
++	}
++	if string(magic) != remotePairingPacketMagic {
++		return nil, fmt.Errorf("remotePairingRawConn.Receive: invalid packet magic")
++	}
++	var size uint16
++	if err := binary.Read(r.conn, binary.BigEndian, &size); err != nil {
++		return nil, fmt.Errorf("remotePairingRawConn.Receive: failed to read size: %w", err)
++	}
++	body := make([]byte, int(size))
++	if _, err := io.ReadFull(r.conn, body); err != nil {
++		return nil, fmt.Errorf("remotePairingRawConn.Receive: failed to read body: %w", err)
++	}
++	var value map[string]interface{}
++	if err := json.Unmarshal(body, &value); err != nil {
++		return nil, fmt.Errorf("remotePairingRawConn.Receive: failed to decode JSON: %w", err)
++	}
++	return map[string]interface{}{"value": value}, nil
++}
+diff --git a/ios/tunnel/remote_pairing_raw_test.go b/ios/tunnel/remote_pairing_raw_test.go
+new file mode 100644
+index 0000000..9bb2d65
+--- /dev/null
++++ b/ios/tunnel/remote_pairing_raw_test.go
+@@ -0,0 +1,73 @@
++package tunnel
++
++import (
++	"encoding/binary"
++	"encoding/json"
++	"io"
++	"net"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestRemotePairingRawConnSend(t *testing.T) {
++	client, server := net.Pipe()
++	defer client.Close()
++	defer server.Close()
++	raw := newRemotePairingRawConn(client)
++	errCh := make(chan error, 1)
++	go func() {
++		errCh <- raw.Send(map[string]interface{}{
++			"mangledTypeName": "RemotePairing.ControlChannelMessageEnvelope",
++			"value": map[string]interface{}{
++				"message": map[string]interface{}{"bytes": []byte{1, 2, 3}},
++			},
++		})
++	}()
++
++	magic := make([]byte, len(remotePairingPacketMagic))
++	_, err := io.ReadFull(server, magic)
++	require.NoError(t, err)
++	assert.Equal(t, remotePairingPacketMagic, string(magic))
++	var size uint16
++	require.NoError(t, binary.Read(server, binary.BigEndian, &size))
++	body := make([]byte, int(size))
++	_, err = io.ReadFull(server, body)
++	require.NoError(t, err)
++	var decoded map[string]interface{}
++	require.NoError(t, json.Unmarshal(body, &decoded))
++	assert.Equal(t, "AQID", decoded["message"].(map[string]interface{})["bytes"])
++	require.NoError(t, <-errCh)
++}
++
++func TestRemotePairingRawConnReceive(t *testing.T) {
++	client, server := net.Pipe()
++	defer client.Close()
++	defer server.Close()
++	raw := newRemotePairingRawConn(client)
++	value := map[string]interface{}{
++		"message": map[string]interface{}{"plain": map[string]interface{}{"_0": "ok"}},
++	}
++	body, err := json.Marshal(value)
++	require.NoError(t, err)
++	go func() {
++		_, _ = server.Write([]byte(remotePairingPacketMagic))
++		_ = binary.Write(server, binary.BigEndian, uint16(len(body)))
++		_, _ = server.Write(body)
++	}()
++
++	decoded, err := raw.ReceiveOnClientServerStream()
++	require.NoError(t, err)
++	assert.Equal(t, value, decoded["value"])
++}
++
++func TestDecodeWireBytesAcceptsRawAndBase64(t *testing.T) {
++	raw := []byte{1, 2, 3}
++	decoded, err := decodeWireBytes(raw)
++	require.NoError(t, err)
++	assert.Equal(t, raw, decoded)
++	decoded, err = decodeWireBytes("AQID")
++	require.NoError(t, err)
++	assert.Equal(t, raw, decoded)
++}
+diff --git a/ios/tunnel/rwcendpoint.go b/ios/tunnel/rwcendpoint.go
+index e56a38b..806b08a 100644
+--- a/ios/tunnel/rwcendpoint.go
++++ b/ios/tunnel/rwcendpoint.go
+@@ -48,6 +48,9 @@ type Endpoint struct {
+ 	// wg keeps track of running goroutines.
+ 	wg sync.WaitGroup
+ 
++	// done receives the terminal read error that stopped the inbound packet pump.
++	done chan error
++
+ 	// metrics counts packets/bytes and accumulates wall-time spent in each stage
+ 	// of the two pump loops, so we can see where the data plane spends its time
+ 	// (device read vs gVisor inject vs waiting for gVisor vs device write).
+@@ -111,6 +114,7 @@ func RWCEndpointNew(rw io.ReadWriter, mtu uint32, offset int) (*Endpoint, error)
+ 		rw:       rw,
+ 		mtu:      mtu,
+ 		offset:   offset,
++		done:     make(chan error, 1),
+ 	}, nil
+ }
+ 
+@@ -136,6 +140,11 @@ func (e *Endpoint) Wait() {
+ 	e.wg.Wait()
+ }
+ 
++// Done reports the terminal read error that stopped the tunnel data plane.
++func (e *Endpoint) Done() <-chan error {
++	return e.done
++}
++
+ // dispatchLoop dispatches packets to upper layer.
+ func (e *Endpoint) dispatchLoop(cancel context.CancelFunc) {
+ 	// Call cancel() to ensure (*Endpoint).outboundLoop(context.Context) exits
+@@ -155,6 +164,8 @@ func (e *Endpoint) dispatchLoop(cancel context.CancelFunc) {
+ 			// deferred cancel also stops outboundLoop), so make the cause
+ 			// visible instead of failing silently.
+ 			golog.Error("userspace tunnel inbound dispatch loop stopped", "module", logModule, "error", err)
++			e.done <- err
++			close(e.done)
+ 			break
+ 		}
+ 
+diff --git a/ios/tunnel/rwcendpoint_done_test.go b/ios/tunnel/rwcendpoint_done_test.go
+new file mode 100644
+index 0000000..838feb4
+--- /dev/null
++++ b/ios/tunnel/rwcendpoint_done_test.go
+@@ -0,0 +1,37 @@
++package tunnel
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++type terminalReadWriter struct {
++	err error
++}
++
++func (rw terminalReadWriter) Read([]byte) (int, error) {
++	return 0, rw.err
++}
++
++func (terminalReadWriter) Write(p []byte) (int, error) {
++	return len(p), nil
++}
++
++func TestEndpointDoneReportsTerminalReadError(t *testing.T) {
++	want := errors.New("outer transport stopped")
++	endpoint, err := RWCEndpointNew(terminalReadWriter{err: want}, 1500, 0)
++	require.NoError(t, err)
++	_, cancel := context.WithCancel(context.Background())
++	go endpoint.dispatchLoop(cancel)
++
++	select {
++	case got := <-endpoint.Done():
++		require.ErrorIs(t, got, want)
++	case <-time.After(time.Second):
++		t.Fatal("endpoint did not report terminal read error")
++	}
++}
+diff --git a/ios/tunnel/tlv.go b/ios/tunnel/tlv.go
+index 483dbc3..78baf29 100644
+--- a/ios/tunnel/tlv.go
++++ b/ios/tunnel/tlv.go
+@@ -106,7 +106,10 @@ func (r tlvReader) readCoalesced(t tlvType) ([]byte, error) {
+ 			}
+ 			return nil, err
+ 		}
+-		l, _ := reader.ReadByte()
++		l, err := reader.ReadByte()
++		if err != nil {
++			return nil, fmt.Errorf("readCoalesced: truncated TLV header: %w", err)
++		}
+ 		if tlvType(chunkType) == t {
+ 			_, err = io.CopyN(buf, reader, int64(l))
+ 		} else {
+diff --git a/ios/tunnel/tunnel.go b/ios/tunnel/tunnel.go
+index cd1bba6..321e50b 100644
+--- a/ios/tunnel/tunnel.go
++++ b/ios/tunnel/tunnel.go
+@@ -24,7 +24,7 @@ import (
+ 	"github.com/quic-go/quic-go"
+ )
+ 
+-const logModule = "go-ios/tunnel"
++const logModule = "Link Core/Tunnel"
+ 
+ // Tunnel describes the parameters of an established tunnel to the device
+ type Tunnel struct {
+@@ -35,9 +35,11 @@ type Tunnel struct {
+ 	// Udid is the id of the device for this tunnel
+ 	Udid string `json:"udid"`
+ 	// Userspace TUN device is used, connect to the local tcp port at Default
+-	UserspaceTUN     bool `json:"userspaceTun"`
+-	UserspaceTUNPort int  `json:"userspaceTunPort"`
+-	closer           func() error
++	UserspaceTUN      bool   `json:"userspaceTun"`
++	UserspaceTUNToken []byte `json:"-"`
++	UserspaceTUNPort  int    `json:"userspaceTunPort"`
++	closer            func() error
++	done              <-chan error
+ }
+ 
+ // Close closes the connection to the device and removes the virtual network interface from the host
+@@ -45,6 +47,12 @@ func (t Tunnel) Close() error {
+ 	return t.closer()
+ }
+ 
++// Done reports terminal failure of a userspace tunnel's outer packet pump.
++// Non-userspace tunnels return nil because they do not expose this lifecycle.
++func (t Tunnel) Done() <-chan error {
++	return t.done
++}
++
+ // ManualPairAndConnectToTunnel tries to verify an existing pairing, and if this fails it triggers a new manual pairing process.
+ // After a successful pairing a tunnel for this device gets started and the tunnel information is returned
+ func ManualPairAndConnectToTunnel(ctx context.Context, device ios.DeviceEntry, p PairRecordManager) (Tunnel, error) {
+diff --git a/ios/tunnel/tunnel_api.go b/ios/tunnel/tunnel_api.go
+index 4dfde47..968e3c3 100644
+--- a/ios/tunnel/tunnel_api.go
++++ b/ios/tunnel/tunnel_api.go
+@@ -44,7 +44,7 @@ func IsAgentRunning() bool {
+ }
+ func WaitUntilAgentReady() bool {
+ 	for {
+-		golog.Info("Waiting for go-ios agent to be ready...", "module", logModule)
++		golog.Info("Waiting for Link Core agent to be ready...", "module", logModule)
+ 		resp, err := netClient.Get(fmt.Sprintf("http://%s:%d/ready", ios.HttpApiHost(), ios.HttpApiPort()))
+ 		if err != nil {
+ 			return false
+diff --git a/ios/tunnel/tunnel_tcp.go b/ios/tunnel/tunnel_tcp.go
+index c4fabda..a20535c 100644
+--- a/ios/tunnel/tunnel_tcp.go
++++ b/ios/tunnel/tunnel_tcp.go
+@@ -2,13 +2,104 @@ package tunnel
+ 
+ import (
+ 	"context"
++	"crypto/rand"
++	"errors"
+ 	"fmt"
++	"net"
++	"strconv"
++	"time"
+ 
+ 	"github.com/danielpaulus/go-ios/ios"
+ 	"github.com/danielpaulus/go-ios/ios/http"
+ 	"github.com/danielpaulus/go-ios/ios/tunnel/tlspsk"
+ )
+ 
++// ConnectRemotePairingTCPUserspace establishes the iOS 18.2+ TLS-PSK tunnel
++// through an explicit RemotePairing endpoint. This avoids usbmuxd and Bonjour
++// discovery and exposes the tunnel through a local userspace TCP forwarder.
++func ConnectRemotePairingTCPUserspace(ctx context.Context, device ios.DeviceEntry, address string, remotePairingPort int, ifacePort int, p PairRecordManager) (Tunnel, error) {
++	if net.ParseIP(address) == nil {
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: endpoint must be an IP address")
++	}
++	if remotePairingPort <= 0 || remotePairingPort > 65535 {
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: invalid RemotePairing port")
++	}
++
++	device.UserspaceTUNToken = make([]byte, 32)
++	if _, err := rand.Read(device.UserspaceTUNToken); err != nil {
++		return Tunnel{}, fmt.Errorf("forwarder credential generation failed: %w", err)
++	}
++	controlConn, err := ios.DialTunnelTCP(net.JoinHostPort(address, strconv.Itoa(remotePairingPort)))
++	if err != nil {
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to connect to RemotePairing: %w", err)
++	}
++	handshakeDeadline := remotePairingHandshakeDeadline(ctx)
++	if err := controlConn.SetDeadline(handshakeDeadline); err != nil {
++		_ = controlConn.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to set handshake deadline: %w", err)
++	}
++	ts := newTunnelServiceWithControl(newRemotePairingRawConn(controlConn), controlConn, p)
++	if err := ts.VerifyPair(); err != nil {
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: pair verification failed: %w", err)
++	}
++
++	tunnelPort, err := ts.createTcpTunnelListener()
++	if err != nil {
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to create TCP tunnel listener: %w", err)
++	}
++	if err := controlConn.SetDeadline(time.Time{}); err != nil {
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to clear handshake deadline: %w", err)
++	}
++
++	dataConn, err := ios.DialTunnelTCP(net.JoinHostPort(address, strconv.Itoa(int(tunnelPort))))
++	if err != nil {
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to connect to TCP tunnel listener: %w", err)
++	}
++	if err := dataConn.SetDeadline(remotePairingHandshakeDeadline(ctx)); err != nil {
++		_ = dataConn.Close()
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to set data handshake deadline: %w", err)
++	}
++	tlsConn, err := tlspsk.Client(dataConn, ts.sharedSecret)
++	if err != nil {
++		_ = dataConn.Close()
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: TLS-PSK handshake failed: %w", err)
++	}
++
++	tun, err := connectToUserspaceTunnelLockdown(ctx, device, tlsConn, ifacePort)
++	if err != nil {
++		_ = tlsConn.Close()
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: userspace tunnel failed: %w", err)
++	}
++	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
++		_ = tun.Close()
++		_ = ts.Close()
++		return Tunnel{}, fmt.Errorf("ConnectRemotePairingTCPUserspace: failed to clear data handshake deadline: %w", err)
++	}
++	tun.UserspaceTUNToken = device.UserspaceTUNToken
++	tun.UserspaceTUN = true
++	tun.UserspaceTUNPort = ifacePort
++	originalClose := tun.closer
++	tun.closer = func() error {
++		return errors.Join(originalClose(), ts.Close())
++	}
++	return tun, nil
++}
++
++func remotePairingHandshakeDeadline(ctx context.Context) time.Time {
++	deadline := time.Now().Add(8 * time.Second)
++	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
++		return contextDeadline
++	}
++	return deadline
++}
++
+ // ManualPairAndConnectToTunnelTCP establishes a tunnel over the TLS-PSK TCP
+ // transport that iOS 18.2+ uses in place of QUIC (which Apple removed). It
+ // mirrors ManualPairAndConnectToTunnel up to and including pairing, then asks the
+diff --git a/ios/tunnel/untrusted.go b/ios/tunnel/untrusted.go
+index b58704b..e495d02 100644
+--- a/ios/tunnel/untrusted.go
++++ b/ios/tunnel/untrusted.go
+@@ -26,16 +26,20 @@ import (
+ const untrustedTunnelServiceName = "com.apple.internal.dt.coredevice.untrusted.tunnelservice"
+ 
+ func newTunnelServiceWithXpc(xpcConn *xpc.Connection, c io.Closer, pairRecords PairRecordManager) *tunnelService {
++	return newTunnelServiceWithControl(xpcConn, c, pairRecords)
++}
++
++func newTunnelServiceWithControl(conn xpcConn, c io.Closer, pairRecords PairRecordManager) *tunnelService {
+ 	return &tunnelService{
+-		xpcConn:        xpcConn,
++		xpcConn:        conn,
+ 		c:              c,
+-		controlChannel: newControlChannelReadWriter(xpcConn),
++		controlChannel: newControlChannelReadWriter(conn),
+ 		pairRecords:    pairRecords,
+ 	}
+ }
+ 
+ type tunnelService struct {
+-	xpcConn *xpc.Connection
++	xpcConn xpcConn
+ 	c       io.Closer
+ 
+ 	controlChannel *controlChannelReadWriter
+@@ -53,11 +57,9 @@ func (t *tunnelService) Close() error {
+ 	return t.c.Close()
+ }
+ 
+-// ManualPair triggers a device pairing that requires the user to press the 'Trust' button on the device that appears
+-// when this operation is triggered
+-// If there is already an active pairing with the credentials stored in PairRecordManager this call does not trigger
+-// anything on the device and returns with an error
+-func (t *tunnelService) ManualPair() error {
++// VerifyPair verifies only the identity already held by PairRecordManager. It
++// never falls back to a new pairing prompt.
++func (t *tunnelService) VerifyPair() error {
+ 	err := t.controlChannel.writeRequest(map[string]interface{}{
+ 		"handshake": map[string]interface{}{
+ 			"_0": map[string]interface{}{
+@@ -70,15 +72,26 @@ func (t *tunnelService) ManualPair() error {
+ 	})
+ 
+ 	if err != nil {
+-		return fmt.Errorf("ManualPair: failed to send 'attemptPairVerify' request: %w", err)
++		return fmt.Errorf("VerifyPair: failed to send 'attemptPairVerify' request: %w", err)
+ 	}
+ 	// ignore the response for now
+ 	_, err = t.controlChannel.read()
+ 	if err != nil {
+-		return fmt.Errorf("ManualPair: failed to read 'attemptPairVerify' response: %w", err)
++		return fmt.Errorf("VerifyPair: failed to read 'attemptPairVerify' response: %w", err)
++	}
++	if err := t.verifyPair(); err != nil {
++		return fmt.Errorf("VerifyPair: saved identity was rejected: %w", err)
+ 	}
++	return nil
++}
++
++// ManualPair triggers a device pairing that requires the user to press the 'Trust' button on the device that appears
++// when this operation is triggered
++// If there is already an active pairing with the credentials stored in PairRecordManager this call does not trigger
++// anything on the device and returns with an error
++func (t *tunnelService) ManualPair() error {
++	err := t.VerifyPair()
+ 
+-	err = t.verifyPair()
+ 	if err == nil {
+ 		return nil
+ 	}
+@@ -303,7 +316,13 @@ func (t *tunnelService) createUnlockKey() ([]byte, error) {
+ }
+ 
+ func (t *tunnelService) verifyPair() error {
+-	key, _ := ecdh.X25519().GenerateKey(rand.Reader)
++	if len(t.pairRecords.peerPublicKey) != ed25519.PublicKeySize || t.pairRecords.peerIdentifier == "" {
++		return fmt.Errorf("verifyPair: trusted device identity pin missing")
++	}
++	key, err := ecdh.X25519().GenerateKey(rand.Reader)
++	if err != nil {
++		return err
++	}
+ 	tlv := newTlvBuffer()
+ 	tlv.writeByte(typeState, pairStateStartRequest)
+ 	tlv.writeData(typePublicKey, key.PublicKey().Bytes())
+@@ -321,11 +340,14 @@ func (t *tunnelService) verifyPair() error {
+ 	}
+ 
+ 	var devP pairingData
+-	err := t.controlChannel.readEvent(&devP)
++	err = t.controlChannel.readEvent(&devP)
+ 	if err != nil {
+ 		return err
+ 	}
+ 
++	if err := validateVerifyReply(devP, pairStateStartResponse); err != nil {
++		return err
++	}
+ 	devicePublicKeyBytes, err := tlvReader(devP.data).readCoalesced(typePublicKey)
+ 	if err != nil {
+ 		return err
+@@ -359,6 +381,29 @@ func (t *tunnelService) verifyPair() error {
+ 		return err
+ 	}
+ 
++	// Authenticate the device before releasing the host identity signature.
++	encryptedPeer, err := tlvReader(devP.data).readCoalesced(typeEncryptedData)
++	if err != nil {
++		return err
++	}
++	noncePeer := make([]byte, 12)
++	copy(noncePeer[4:], "PV-Msg02")
++	peerProof, err := ci.Open(nil, noncePeer, encryptedPeer, nil)
++	if err != nil {
++		return fmt.Errorf("verifyPair: invalid device encrypted proof: %w", err)
++	}
++	identifier, err := tlvReader(peerProof).readCoalesced(typeIdentifier)
++	if err != nil {
++		return err
++	}
++	sig, err := tlvReader(peerProof).readCoalesced(typeSignature)
++	if err != nil {
++		return err
++	}
++	transcript := append(append(append([]byte{}, devicePublicKeyBytes...), identifier...), key.PublicKey().Bytes()...)
++	if string(identifier) != t.pairRecords.peerIdentifier || !ed25519.Verify(t.pairRecords.peerPublicKey, transcript, sig) {
++		return fmt.Errorf("verifyPair: device identity signature mismatch")
++	}
+ 	signBuf := bytes.NewBuffer(nil)
+ 	// Write on bytes.Buffer never returns an error
+ 	_, _ = signBuf.Write(key.PublicKey().Bytes())
+@@ -396,6 +441,9 @@ func (t *tunnelService) verifyPair() error {
+ 		return err
+ 	}
+ 
++	if err := validateVerifyReply(responseEvent, pairStateVerifyResponse); err != nil {
++		return err
++	}
+ 	errRes, err := tlvReader(responseEvent.data).readCoalesced(typeError)
+ 	if err != nil {
+ 		return err
+@@ -492,7 +540,7 @@ func (t *tunnelService) exchangeDeviceInfo(sessionKey []byte) error {
+ 		"altIRK":                      []byte{0x5e, 0xca, 0x81, 0x91, 0x92, 0x02, 0x82, 0x00, 0x11, 0x22, 0x33, 0x44, 0xbb, 0xf2, 0x4a, 0xc8},
+ 		"btAddr":                      "FF:DD:99:66:BB:AA",
+ 		"mac":                         []byte{0xff, 0x44, 0x88, 0x66, 0x33, 0x99},
+-		"model":                       "go-ios",
++		"model":                       "Link Core",
+ 		"name":                        "host-name",
+ 		"remotepairing_serial_number": "remote-serial",
+ 	})
+@@ -551,3 +599,25 @@ func (t *tunnelService) exchangeDeviceInfo(sessionKey []byte) error {
+ 	}
+ 	return nil
+ }
++
++// validateVerifyReply rejects errors and out-of-order or malformed pair-verify messages.
++func validateVerifyReply(p pairingData, expected byte) error {
++	if p.kind != "verifyManualPairing" {
++		return fmt.Errorf("verifyPair: unexpected pairing event")
++	}
++	e, err := tlvReader(p.data).readCoalesced(typeError)
++	if err != nil {
++		return err
++	}
++	if len(e) > 0 {
++		return tlvError(e[0])
++	}
++	state, err := tlvReader(p.data).readCoalesced(typeState)
++	if err != nil {
++		return err
++	}
++	if len(state) != 1 || state[0] != expected {
++		return fmt.Errorf("verifyPair: unexpected protocol state")
++	}
++	return nil
++}
+diff --git a/ios/tunnel/userspace_auth_test.go b/ios/tunnel/userspace_auth_test.go
+new file mode 100644
+index 0000000..fe624f4
+--- /dev/null
++++ b/ios/tunnel/userspace_auth_test.go
+@@ -0,0 +1,70 @@
++package tunnel
++
++import (
++	"bytes"
++	"encoding/binary"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++type authTestConn struct {
++	*bytes.Reader
++	closed   bool
++	deadline bool
++}
++
++func (c *authTestConn) Write(p []byte) (int, error) { return len(p), nil }
++func (c *authTestConn) Close() error                { c.closed = true; return nil }
++func (c *authTestConn) LocalAddr() net.Addr         { return &net.TCPAddr{} }
++func (c *authTestConn) RemoteAddr() net.Addr        { return &net.TCPAddr{} }
++func (c *authTestConn) SetDeadline(time.Time) error { return nil }
++func (c *authTestConn) SetReadDeadline(t time.Time) error {
++	if !t.IsZero() {
++		c.deadline = true
++	}
++	return nil
++}
++func (c *authTestConn) SetWriteDeadline(time.Time) error { return nil }
++func TestUserspaceForwarderAuthentication(t *testing.T) {
++	token := bytes.Repeat([]byte{42}, 32)
++	ip := net.ParseIP("fd00::1234")
++	preamble := make([]byte, 20)
++	copy(preamble, ip.To16())
++	binary.LittleEndian.PutUint32(preamble[16:], 12345)
++	for _, kind := range []string{"valid", "wrong-token", "missing-token", "bad-destination", "bad-port"} {
++		t.Run(kind, func(t *testing.T) {
++			data := append(append([]byte{}, token...), preamble...)
++			switch kind {
++			case "wrong-token":
++				data[0] ^= 1
++			case "missing-token":
++				data = preamble
++			case "bad-destination":
++				data[32] ^= 1
++			case "bad-port":
++				binary.LittleEndian.PutUint32(data[48:], 65536)
++			}
++			c := &authTestConn{Reader: bytes.NewReader(data)}
++			iface := UserSpaceTUNInterface{authToken: token, deviceAddress: ip}
++			// Invalid inputs must be rejected before touching the nil network stack.
++			if kind == "valid" {
++				s := stack.New(stack.Options{})
++				defer s.Destroy()
++				iface.networkStack = s
++			}
++			handleUserspaceConn(iface, c)
++			if !c.closed || !c.deadline {
++				t.Fatal("connection not closed or read deadline missing")
++			}
++			if kind == "wrong-token" && c.Len() != 20 {
++				t.Fatal("read target before authentication")
++			}
++		})
++	}
++}
++
++var _ net.Conn = (*authTestConn)(nil)
++var _ io.ReadWriteCloser = (*authTestConn)(nil)
+diff --git a/ios/tunnel/userspace_tunnel.go b/ios/tunnel/userspace_tunnel.go
+index 37248c5..b5226ad 100644
+--- a/ios/tunnel/userspace_tunnel.go
++++ b/ios/tunnel/userspace_tunnel.go
+@@ -2,6 +2,7 @@ package tunnel
+ 
+ import (
+ 	"context"
++	"crypto/subtle"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -45,7 +46,9 @@ func createIoCloser(rw1, rw2 io.ReadWriteCloser) ioResourceCloser {
+ // Set it up with the Init method and provide a io.ReadWriter to a IP/TUN compatible device.
+ // If EnableSniffer, raw TCP packets will be dumped to the console.
+ type UserSpaceTUNInterface struct {
+-	nicID tcpip.NICID
++	nicID         tcpip.NICID
++	authToken     []byte
++	deviceAddress net.IP
+ 	//If EnableSniffer, raw TCP packets will be dumped to the console.
+ 	EnableSniffer bool
+ 	networkStack  *stack.Stack
+@@ -54,6 +57,11 @@ type UserSpaceTUNInterface struct {
+ 	endpoint *Endpoint
+ }
+ 
++// Done reports terminal failure of the outer userspace packet pump.
++func (iface *UserSpaceTUNInterface) Done() <-chan error {
++	return iface.endpoint.Done()
++}
++
+ func (iface *UserSpaceTUNInterface) TunnelRWCThroughInterface(localPort uint16, remoteAddr net.IP, remotePort uint16, rw io.ReadWriteCloser) error {
+ 	defer rw.Close()
+ 	remote := tcpip.FullAddress{
+@@ -210,13 +218,13 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
+ 	// Read == one packet, and without reframing TCP coalescing corrupts and drops
+ 	// packets (see framing.go; the kernel path reframes in forwardTCPToInterface).
+ 	framedConn := newFramedIPv6Conn(connToDevice)
+-	iface := UserSpaceTUNInterface{}
++	iface := UserSpaceTUNInterface{authToken: device.UserspaceTUNToken, deviceAddress: net.ParseIP(tunnelInfo.ServerAddress)}
+ 	err = iface.Init(uint32(tunnelInfo.ClientParameters.Mtu), framedConn, tunnelInfo.ClientParameters.Address, prefixLength)
+ 	if err != nil {
+ 		return Tunnel{}, fmt.Errorf("could not setup tunnel interface. %w", err)
+ 	}
+ 
+-	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", ifacePort))
++	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ifacePort))
+ 	if err != nil {
+ 		return Tunnel{}, fmt.Errorf("could not setup listener. %w", err)
+ 	}
+@@ -268,6 +276,7 @@ func connectToUserspaceTunnelLockdown(ctx context.Context, device ios.DeviceEntr
+ 		RsdPort: int(tunnelInfo.ServerRSDPort),
+ 		Udid:    device.Properties.SerialNumber,
+ 		closer:  closeFunc,
++		done:    iface.Done(),
+ 	}, nil
+ }
+ 
+@@ -314,6 +323,8 @@ func listenToConns(iface UserSpaceTUNInterface, listener net.Listener) error {
+ 		golog.Info("Stopped listening for connections", "module", logModule)
+ 	}()
+ 
++	// Bound both authenticated and stalled local connections.
++	slots := make(chan struct{}, 64)
+ 	for {
+ 		client, err := listener.Accept()
+ 		if err != nil {
+@@ -322,7 +333,12 @@ func listenToConns(iface UserSpaceTUNInterface, listener net.Listener) error {
+ 			// they must never tear down the accept loop.
+ 			return err
+ 		}
+-		go handleUserspaceConn(iface, client)
++		select {
++		case slots <- struct{}{}:
++			go func() { defer func() { <-slots }(); handleUserspaceConn(iface, client) }()
++		default:
++			_ = client.Close()
++		}
+ 	}
+ }
+ 
+@@ -335,6 +351,14 @@ func listenToConns(iface UserSpaceTUNInterface, listener net.Listener) error {
+ func handleUserspaceConn(iface UserSpaceTUNInterface, client net.Conn) {
+ 	golog.Info("Received connection request", "module", logModule, "from", client.RemoteAddr(), "to", client.LocalAddr())
+ 
++	_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
++	if len(iface.authToken) != 0 {
++		provided := make([]byte, 32)
++		if _, err := io.ReadFull(client, provided); err != nil || subtle.ConstantTimeCompare(provided, iface.authToken) != 1 {
++			_ = client.Close()
++			return
++		}
++	}
+ 	preamble := make([]byte, 20)
+ 	if _, err := io.ReadFull(client, preamble); err != nil {
+ 		golog.Error("failed to read userspace tunnel connection preamble", "module", logModule, "error", err)
+@@ -343,6 +367,11 @@ func handleUserspaceConn(iface UserSpaceTUNInterface, client net.Conn) {
+ 	}
+ 	remoteAddr := net.IP(preamble[:16])
+ 	port := binary.LittleEndian.Uint32(preamble[16:20])
++	if port == 0 || port > 65535 || (len(iface.authToken) != 0 && !remoteAddr.Equal(iface.deviceAddress)) {
++		_ = client.Close()
++		return
++	}
++	_ = client.SetReadDeadline(time.Time{})
+ 	golog.Info("Received connection request to device", "module", logModule, "ip", remoteAddr, "port", port)
+ 
+ 	if err := iface.TunnelRWCThroughInterface(0, remoteAddr, uint16(port), client); err != nil {
+diff --git a/ios/zipconduit/zip_utils.go b/ios/zipconduit/zip_utils.go
+index c8c99ad..a0a7382 100644
+--- a/ios/zipconduit/zip_utils.go
++++ b/ios/zipconduit/zip_utils.go
+@@ -5,7 +5,7 @@ import (
+ 	"strings"
+ )
+ 
+-const logModule = "go-ios/zipconduit"
++const logModule = "Link Core/ZipConduit"
+ 
+ // sadly apple does not use a standard compliant zip implementation for this
+ // so I had to hack my own basic pseudo zip format together.
+diff --git a/ios/zipconduit/zipconduit_installer.go b/ios/zipconduit/zipconduit_installer.go
+index 754b47f..64d1d64 100644
+--- a/ios/zipconduit/zipconduit_installer.go
++++ b/ios/zipconduit/zipconduit_installer.go
+@@ -59,6 +59,8 @@ type Connection struct {
+ 	plistCodec ios.PlistCodecReadWriter
+ }
+ 
++type ProgressHandler func(percent int, status string)
++
+ // New returns a new ZipConduit Connection for the given DeviceID and Udid
+ func New(device ios.DeviceEntry) (*Connection, error) {
+ 	if !device.SupportsRsd() {
+@@ -98,6 +100,12 @@ func NewWithShimConnection(device ios.DeviceEntry) (*Connection, error) {
+ // If you specify appFilePath to a file, it will try to Unzip it to a temp dir first and then send.
+ // If appFilePath points to a directory, it will try to install the dir contents as an app.
+ func (conn Connection) SendFile(appFilePath string) error {
++	return conn.SendFileWithProgress(appFilePath, nil)
++}
++
++// SendFileWithProgress installs an app and reports each device installation
++// progress update to handler. A nil handler preserves SendFile behavior.
++func (conn Connection) SendFileWithProgress(appFilePath string, handler ProgressHandler) error {
+ 	openedFile, err := os.Open(appFilePath)
+ 	if err != nil {
+ 		return err
+@@ -110,16 +118,16 @@ func (conn Connection) SendFile(appFilePath string) error {
+ 		return err
+ 	}
+ 	if info.IsDir() {
+-		return conn.sendDirectory(appFilePath)
++		return conn.sendDirectory(appFilePath, handler)
+ 	}
+-	return conn.sendIpaFile(appFilePath)
++	return conn.sendIpaFile(appFilePath, handler)
+ }
+ 
+ func (conn Connection) Close() error {
+ 	return conn.deviceConn.Close()
+ }
+ 
+-func (conn Connection) sendDirectory(dir string) error {
++func (conn Connection) sendDirectory(dir string, handler ProgressHandler) error {
+ 	tmpDir, err := os.MkdirTemp("", "prefix")
+ 	if err != nil {
+ 		return err
+@@ -185,10 +193,10 @@ func (conn Connection) sendDirectory(dir string) error {
+ 		return err
+ 	}
+ 
+-	return conn.waitForInstallation()
++	return conn.waitForInstallation(handler)
+ }
+ 
+-func (conn Connection) sendIpaFile(ipaFile string) error {
++func (conn Connection) sendIpaFile(ipaFile string, handler ProgressHandler) error {
+ 	ipa, err := zip.OpenReader(ipaFile)
+ 	if err != nil {
+ 		return err
+@@ -249,10 +257,10 @@ func (conn Connection) sendIpaFile(ipaFile string) error {
+ 		return err
+ 	}
+ 
+-	return conn.waitForInstallation()
++	return conn.waitForInstallation(handler)
+ }
+ 
+-func (conn Connection) waitForInstallation() error {
++func (conn Connection) waitForInstallation(handler ProgressHandler) error {
+ 	for {
+ 		var plist map[string]interface{}
+ 		err := conn.plistCodec.Read(&plist)
+@@ -265,9 +273,15 @@ func (conn Connection) waitForInstallation() error {
+ 			return err
+ 		}
+ 		if done {
++			if handler != nil {
++				handler(100, status)
++			}
+ 			golog.Info("installation successful", "module", logModule)
+ 			return nil
+ 		}
++		if handler != nil {
++			handler(percent, status)
++		}
+ 		golog.Info("installing", "module", logModule, "status", status, "percentComplete", percent)
+ 	}
+ }

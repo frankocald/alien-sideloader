@@ -1,0 +1,12 @@
+{
+  "schema_version": 4,
+  "device_label": "development iphone",
+  "remote_identifier": "EXAMPLE-DEVICE-ID",
+  "target_tailnet_ip": "100.64.0.10",
+  "remote_pairing_port": 49152,
+  "pair_record_path": "/absolute/path/to/private/pairing.plist",
+  "local_forward_port": 61015,
+  "connect_timeout_seconds": 12,
+  "retry_interval_seconds": 5,
+  "install_timeout_seconds": 300
+}
